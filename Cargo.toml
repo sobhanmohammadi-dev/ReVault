@@ -4,3 +4,44 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+
+# TUI
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+crossterm = "0.29"
+
+# Async / Concurrency
+tokio = { version = "1", features = ["full"] }
+
+# Error Handling
+error-stack = "0.8"
+thiserror = "2"
+
+# Logging / Diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization / Data Model
+serde = { version = "1", features = ["derive"] }
+
+# IDs
+uuid = { version = "1.25", features = ["v7"] }
+
+# Cryptography
+argon2 = "0.5"
+aes-gcm = "0.11"
+sha2 = "0.11"
+
+# Secure Randomness
+rand = "0.9"
+
+# Secret / Key Memory Protection
+zeroize = { version = "1", features = ["derive"] }
+
+# Binary Encoding / Decoding
+bytes = "1"
+
+# File / Temp File Handling
+tempfile = "3"
