@@ -3,6 +3,7 @@ pub enum Tab {
     Vaults,
     Network,
     Logs,
+    Settings
 }
 
 impl Tab {
@@ -11,6 +12,7 @@ impl Tab {
             Self::Vaults => Self::Network,
             Self::Network => Self::Logs,
             Self::Logs => Self::Vaults,
+            Self::Settings => Self::Settings
         }
     }
 
@@ -19,6 +21,7 @@ impl Tab {
             Self::Vaults => 0,
             Self::Network => 1,
             Self::Logs => 2,
+            Self::Settings => 3
         }
     }
 }

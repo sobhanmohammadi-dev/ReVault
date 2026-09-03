@@ -25,6 +25,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
         (true, Tab::Logs) => {
             "Press 'q' to exit Logs, '⬇⬆' to navigate logs."
+        },
+
+        (true, Tab::Settings) => {
+            "Press 'q to exit Settings, '⬇⬆' to navigate settings, '↵' to select tab."
         }
     };
 

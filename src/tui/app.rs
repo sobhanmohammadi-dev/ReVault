@@ -24,4 +24,12 @@ impl App {
     pub fn unlock(&mut self) {
         self.locked = false;
     }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    pub fn index(&self) -> usize {
+        self.selected_tab.index()
+    }
 }

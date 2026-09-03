@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::tui::app::App;
+use crate::tui::tab::Tab;
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
@@ -22,6 +23,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
         KeyCode::Char('q') | KeyCode::Esc if app.locked => {
             app.unlock();
+        }
+        
+        KeyCode::Char('+') if app.selected_tab == Tab::Vaults => {
+            
         }
 
         _ => {}

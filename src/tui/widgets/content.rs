@@ -7,23 +7,20 @@ use ratatui::{
 use crate::tui::tab::Tab;
 
 pub fn render(frame: &mut Frame, area: Rect, selected_tab: Tab) {
-    let text = match selected_tab {
+    let tab = match selected_tab {
         Tab::Vaults => {
-            "Great terminal interfaces start with a single widget."
+            crate::tui::widgets::Vaults::table::render(frame, area)
         }
 
         Tab::Network => {
-            "Coming soon!"
+            crate::tui::widgets::Vaults::table::render(frame, area)
         }
 
         Tab::Logs => {
-            "Render boldly, style with purpose."
+            crate::tui::widgets::Vaults::table::render(frame, area)
+        }
+        Tab::Settings => {
+            crate::tui::widgets::Vaults::table::render(frame, area)
         }
     };
-
-    let block = Paragraph::new(text)
-        .alignment(Alignment::Center)
-        .block(Block::bordered());
-
-    frame.render_widget(block, area);
 }
