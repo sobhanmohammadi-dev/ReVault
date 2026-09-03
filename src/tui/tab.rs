@@ -11,8 +11,8 @@ impl Tab {
         match self {
             Self::Vaults => Self::Network,
             Self::Network => Self::Logs,
-            Self::Logs => Self::Vaults,
-            Self::Settings => Self::Settings
+            Self::Logs => Self::Settings,
+            Self::Settings => Self::Vaults
         }
     }
 
