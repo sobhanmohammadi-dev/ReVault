@@ -35,9 +35,18 @@ uuid = { version = "1.25", features = ["v7"] }
 argon2 = "0.5"
 aes-gcm = "0.11"
 sha2 = "0.11"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Secure Randomness
 rand = "0.9"
+# ed25519-dalek/x25519-dalek 2.x key generation is written against the
+# rand_core 0.6 CryptoRngCore trait, which is a different (incompatible)
+# major version from the rand_core that `rand = "0.9"` uses internally.
+# We pull rand_core 0.6 in explicitly, only for its OsRng, and only at the
+# few call sites that generate dalek keypairs -- everything else in the
+# codebase keeps using `rand` 0.9 as before.
+rand_core_06 = { package = "rand_core", version = "0.6" }
 
 # Secret / Key Memory Protection
 zeroize = { version = "1", features = ["derive"] }
