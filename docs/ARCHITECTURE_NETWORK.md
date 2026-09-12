@@ -150,12 +150,25 @@ Planned, in order of how much extra complexity each adds:
 
 ## What's implemented in this pass vs. deferred
 
-Implemented: `Identity`/`PeerId` (Ed25519 + X25519 keypairs, local
-storage), the envelope-encryption format change (recipient keyring,
-DEK wrapping/unwrapping), `grant_access` / `revoke_access` (with full
-key rotation + re-encryption), and chain-record signing/verification.
+Implemented: `Identity`/`PeerId`, the full envelope-encryption format
+change (format version 2 -- recipient keyring, DEK wrap/unwrap via
+X25519), `Vault::grant_access` / `Vault::revoke_access` (with full key
+rotation + in-place re-encryption of every block), admin-only mutation
+guards (`add_file`/`update_file`/`delete_file`/`grant_access`/
+`revoke_access` all require the vault to have been opened by an identity
+matching its recorded admin), chain-record signing (`ChainRecord::
+new_signed`) and verification (`verify_integrity` now checks every
+record's admin signature, not just its hash linkage), and
+`Vault::open_as_recipient` for a granted peer to open a vault with no
+password at all.
 
 Deferred to the next phase: the actual TCP transport, the Noise
 handshake, the wire sync protocol described above, and any TUI for
-managing peers. All of the above was designed so that phase can be
-added without another format change.
+managing peers (granting/revoking is only reachable via the `core` API
+right now, not yet wired into the Vaults screen). All of the above was
+designed so that phase can be added without another format change.
+
+Note: format version 1 (the original password-direct scheme) is no
+longer readable -- `MIN_SUPPORTED_VERSION` is now 2. There was no real
+deployed vault data at that point, so this was a clean breaking bump
+rather than a migration.
