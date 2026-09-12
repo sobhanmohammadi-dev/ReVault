@@ -5,11 +5,12 @@
 //! Layout of a `.rvlt` file:
 //!
 //! ```text
-//! [0, HEADER_SIZE)                        Header (fixed size, versioned)
-//! [bitmap_offset, +bitmap_len)             Block allocation bitmap (1 bit/block)
-//! [file_table_offset, +file_table_len)     Fixed array of FileEntry slots
-//! [chain_offset, +chain_len)               Fixed array of ChainRecord slots
-//! [data_offset, +block_count*block_size)   Data block region
+//! [0, HEADER_SIZE)                          Header (fixed size, versioned)
+//! [bitmap_offset, +bitmap_len)               Block allocation bitmap (1 bit/block)
+//! [file_table_offset, +file_table_len)       Fixed array of FileEntry slots
+//! [recipient_offset, +recipient_len)         Fixed array of RecipientSlot slots (envelope-encryption keyring)
+//! [chain_offset, +chain_len)                 Fixed array of ChainRecord slots (signed, tamper-evident)
+//! [data_offset, +block_count*block_size)     Data block region
 //! ```
 //!
 //! Everything the vault needs to reopen and operate is inside this single
@@ -18,15 +19,27 @@
 //! This module only deals with *encoding/decoding bytes* and structural
 //! validation (magic, version, bounds, overflow safety). It knows nothing
 //! about encryption or the hash chain's cryptographic linking semantics
-//! beyond storing/loading the raw hash bytes; that logic lives in
-//! `crypto.rs` and `vault.rs`.
+//! beyond storing/loading the raw hash/signature bytes; that logic lives
+//! in `crypto.rs`, `identity.rs`, and `vault.rs`.
+//!
+//! # Format version 2 -- envelope encryption + admin-signed chain
+//!
+//! Version 2 replaces "the content key comes straight from the password"
+//! with envelope encryption: a random per-vault data key (DEK) actually
+//! encrypts content, and is itself wrapped once for the admin's password
+//! and once per granted peer identity (the `RecipientSlot` keyring). The
+//! chain also gains an Ed25519 signature per record, so peers can verify
+//! a change really came from the vault's admin. There is no reader for
+//! the older, password-direct format 1 -- `MIN_SUPPORTED_VERSION` is 2 --
+//! since this predates any real deployed vault data.
 
 use super::error::{Result, VaultError};
+use super::identity::{Identity, SIGNATURE_LEN, SIGNING_PUBLIC_LEN};
 
 pub const MAGIC: &[u8; 8] = b"RVLT0001";
-pub const FORMAT_VERSION: u32 = 1;
-pub const MIN_SUPPORTED_VERSION: u32 = 1;
-pub const MAX_SUPPORTED_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_VERSION: u32 = 2;
+pub const MAX_SUPPORTED_VERSION: u32 = 2;
 
 pub const HEADER_SIZE: u64 = 1024;
 pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
@@ -36,11 +49,21 @@ pub const MAX_DESC_LEN: usize = 256;
 pub const MAX_FILENAME_LEN: usize = 128;
 
 pub const DIRECT_BLOCKS: usize = 8;
-pub const VERIFIER_BLOB_LEN: usize = 64; // nonce(12) + "revault-ok"(10) + tag(16) = 38, padded
+/// Wraps the admin's DEK: nonce(12) + DEK(32) + tag(16) = 60, padded.
+pub const ADMIN_KEY_SLOT_LEN: usize = 64;
+
+/// Fixed, small recipient keyring size -- this targets "a small trusted
+/// set of the admin's own devices/friends," not a public swarm, so a
+/// generous-but-bounded constant is simpler and safer than trying to
+/// scale it with capacity the way the file table does.
+pub const MAX_RECIPIENTS: u32 = 16;
 
 /// File-entry flag bits.
 pub const ENTRY_FLAG_OCCUPIED: u32 = 1 << 0;
 pub const ENTRY_FLAG_DELETED: u32 = 1 << 1;
+
+/// Recipient-slot flag bits.
+pub const RECIPIENT_FLAG_OCCUPIED: u32 = 1 << 0;
 
 /// Chain record operation kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +73,11 @@ pub enum ChainOp {
     FileAdded = 2,
     FileUpdated = 3,
     FileDeleted = 4,
+    /// A peer identity was granted decrypt access.
+    AccessGranted = 5,
+    /// A peer identity was revoked; the DEK was rotated and the whole
+    /// vault re-encrypted under the new key as a result.
+    KeyRotated = 6,
 }
 
 impl ChainOp {
@@ -59,6 +87,8 @@ impl ChainOp {
             2 => ChainOp::FileAdded,
             3 => ChainOp::FileUpdated,
             4 => ChainOp::FileDeleted,
+            5 => ChainOp::AccessGranted,
+            6 => ChainOp::KeyRotated,
             _ => return Err(VaultError::CorruptContainer("unknown chain op code")),
         })
     }
@@ -158,6 +188,12 @@ impl<'a> Reader<'a> {
         out.copy_from_slice(s);
         Ok(out)
     }
+    fn array64(&mut self) -> Result<[u8; 64]> {
+        let s = self.bytes(64)?;
+        let mut out = [0u8; 64];
+        out.copy_from_slice(s);
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -180,7 +216,18 @@ pub struct Header {
     pub argon2_m_cost_kib: u32,
     pub argon2_t_cost: u32,
     pub argon2_p_cost: u32,
-    pub verifier_blob: Vec<u8>,
+    /// AES-256-GCM(key = Argon2id(password), plaintext = DEK) -- unwrapping
+    /// this with the correct password both authenticates the password and
+    /// recovers the vault's actual content key in one step.
+    pub admin_key_slot: Vec<u8>,
+
+    /// The vault admin's root-of-trust identity. Every chain record must
+    /// be signed by `admin_signing_pubkey` for a peer to accept it.
+    pub admin_signing_pubkey: [u8; 32],
+    /// The admin's own X25519 public key, recorded for completeness /
+    /// audit (the admin's own DEK access goes through the password slot
+    /// above, not a recipient slot).
+    pub admin_encryption_pubkey: [u8; 32],
 
     pub bitmap_offset: u64,
     pub bitmap_len: u64,
@@ -189,6 +236,11 @@ pub struct Header {
     pub file_table_len: u64,
     pub max_files: u32,
     pub entry_size: u32,
+
+    pub recipient_offset: u64,
+    pub recipient_len: u64,
+    pub max_recipients: u32,
+    pub recipient_slot_size: u32,
 
     pub chain_offset: u64,
     pub chain_len: u64,
@@ -220,8 +272,11 @@ impl Header {
         w.u32(self.argon2_m_cost_kib);
         w.u32(self.argon2_t_cost);
         w.u32(self.argon2_p_cost);
-        w.u16(self.verifier_blob.len() as u16);
-        w.fixed(&self.verifier_blob, VERIFIER_BLOB_LEN);
+        w.u16(self.admin_key_slot.len() as u16);
+        w.fixed(&self.admin_key_slot, ADMIN_KEY_SLOT_LEN);
+
+        w.fixed(&self.admin_signing_pubkey, 32);
+        w.fixed(&self.admin_encryption_pubkey, 32);
 
         w.u64(self.bitmap_offset);
         w.u64(self.bitmap_len);
@@ -230,6 +285,11 @@ impl Header {
         w.u64(self.file_table_len);
         w.u32(self.max_files);
         w.u32(self.entry_size);
+
+        w.u64(self.recipient_offset);
+        w.u64(self.recipient_len);
+        w.u32(self.max_recipients);
+        w.u32(self.recipient_slot_size);
 
         w.u64(self.chain_offset);
         w.u64(self.chain_len);
@@ -304,12 +364,15 @@ impl Header {
         let argon2_t_cost = r.u32()?;
         let argon2_p_cost = r.u32()?;
 
-        let verifier_len = r.u16()? as usize;
-        let verifier_raw = r.bytes(VERIFIER_BLOB_LEN)?;
-        if verifier_len > VERIFIER_BLOB_LEN {
-            return Err(VaultError::CorruptContainer("verifier_len exceeds field width"));
+        let admin_key_slot_len = r.u16()? as usize;
+        let admin_key_slot_raw = r.bytes(ADMIN_KEY_SLOT_LEN)?;
+        if admin_key_slot_len > ADMIN_KEY_SLOT_LEN {
+            return Err(VaultError::CorruptContainer("admin_key_slot_len exceeds field width"));
         }
-        let verifier_blob = verifier_raw[..verifier_len].to_vec();
+        let admin_key_slot = admin_key_slot_raw[..admin_key_slot_len].to_vec();
+
+        let admin_signing_pubkey = r.array32()?;
+        let admin_encryption_pubkey = r.array32()?;
 
         let bitmap_offset = r.u64()?;
         let bitmap_len = r.u64()?;
@@ -318,6 +381,11 @@ impl Header {
         let file_table_len = r.u64()?;
         let max_files = r.u32()?;
         let entry_size = r.u32()?;
+
+        let recipient_offset = r.u64()?;
+        let recipient_len = r.u64()?;
+        let max_recipients = r.u32()?;
+        let recipient_slot_size = r.u32()?;
 
         let chain_offset = r.u64()?;
         let chain_len = r.u64()?;
@@ -350,8 +418,11 @@ impl Header {
         if file_table_offset < bitmap_offset + bitmap_len {
             return Err(VaultError::CorruptContainer("file_table_offset overlaps bitmap"));
         }
-        if chain_offset < file_table_offset + file_table_len {
-            return Err(VaultError::CorruptContainer("chain_offset overlaps file table"));
+        if recipient_offset < file_table_offset + file_table_len {
+            return Err(VaultError::CorruptContainer("recipient_offset overlaps file table"));
+        }
+        if chain_offset < recipient_offset + recipient_len {
+            return Err(VaultError::CorruptContainer("chain_offset overlaps recipient keyring"));
         }
         if data_offset < chain_offset + chain_len {
             return Err(VaultError::CorruptContainer("data_offset overlaps chain region"));
@@ -370,13 +441,19 @@ impl Header {
             argon2_m_cost_kib,
             argon2_t_cost,
             argon2_p_cost,
-            verifier_blob,
+            admin_key_slot,
+            admin_signing_pubkey,
+            admin_encryption_pubkey,
             bitmap_offset,
             bitmap_len,
             file_table_offset,
             file_table_len,
             max_files,
             entry_size,
+            recipient_offset,
+            recipient_len,
+            max_recipients,
+            recipient_slot_size,
             chain_offset,
             chain_len,
             max_chain_records,
@@ -511,10 +588,89 @@ impl FileEntry {
 }
 
 // ---------------------------------------------------------------------
-// ChainRecord (tamper-evident integrity chain)
+// RecipientSlot -- the envelope-encryption keyring
 // ---------------------------------------------------------------------
 
-pub const CHAIN_RECORD_SIZE: u32 = 160;
+pub const RECIPIENT_SLOT_SIZE: u32 = 192;
+
+#[derive(Debug, Clone)]
+pub struct RecipientSlot {
+    pub signing_pubkey: [u8; 32],
+    pub encryption_pubkey: [u8; 32],
+    /// `super::crypto::WRAPPED_DEK_LEN`-byte wrapped DEK: ephemeral X25519
+    /// pubkey + nonce + AES-256-GCM(DEK).
+    pub wrapped_dek: Vec<u8>,
+    pub granted_at: i64,
+    pub flags: u32,
+}
+
+impl RecipientSlot {
+    pub fn is_occupied(&self) -> bool {
+        self.flags & RECIPIENT_FLAG_OCCUPIED != 0
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(RECIPIENT_SLOT_SIZE as usize);
+        w.fixed(&self.signing_pubkey, 32);
+        w.fixed(&self.encryption_pubkey, 32);
+        w.u16(self.wrapped_dek.len() as u16);
+        w.fixed(&self.wrapped_dek, super::crypto::WRAPPED_DEK_LEN);
+        w.i64(self.granted_at);
+        w.u32(self.flags);
+
+        let crc = super::crypto::sha256(&w.buf);
+        w.fixed(&crc[..4], 4);
+
+        assert!(w.buf.len() as u32 <= RECIPIENT_SLOT_SIZE, "RecipientSlot encoding exceeded RECIPIENT_SLOT_SIZE");
+        while (w.buf.len() as u32) < RECIPIENT_SLOT_SIZE {
+            w.buf.push(0);
+        }
+        w.buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < RECIPIENT_SLOT_SIZE as usize {
+            return Err(VaultError::CorruptContainer("recipient slot too short"));
+        }
+        let mut r = Reader::new(&buf[..RECIPIENT_SLOT_SIZE as usize]);
+        let signing_pubkey = r.array32()?;
+        let encryption_pubkey = r.array32()?;
+        let wrapped_len = r.u16()? as usize;
+        let wrapped_raw = r.bytes(super::crypto::WRAPPED_DEK_LEN)?;
+        if wrapped_len > super::crypto::WRAPPED_DEK_LEN {
+            return Err(VaultError::CorruptContainer("recipient wrapped_dek_len exceeds field width"));
+        }
+        let wrapped_dek = wrapped_raw[..wrapped_len].to_vec();
+        let granted_at = r.i64()?;
+        let flags = r.u32()?;
+
+        let crc_pos = r.pos;
+        let stored_crc = r.bytes(4)?;
+        let computed = super::crypto::sha256(&buf[..crc_pos]);
+        if stored_crc != &computed[..4] {
+            return Err(VaultError::ChecksumMismatch("recipient slot"));
+        }
+
+        Ok(RecipientSlot { signing_pubkey, encryption_pubkey, wrapped_dek, granted_at, flags })
+    }
+
+    pub fn empty_slot() -> Vec<u8> {
+        let slot = RecipientSlot {
+            signing_pubkey: [0; 32],
+            encryption_pubkey: [0; 32],
+            wrapped_dek: Vec::new(),
+            granted_at: 0,
+            flags: 0,
+        };
+        slot.encode()
+    }
+}
+
+// ---------------------------------------------------------------------
+// ChainRecord (tamper-evident, admin-signed integrity chain)
+// ---------------------------------------------------------------------
+
+pub const CHAIN_RECORD_SIZE: u32 = 224;
 
 #[derive(Debug, Clone)]
 pub struct ChainRecord {
@@ -525,22 +681,13 @@ pub struct ChainRecord {
     pub data_hash: [u8; 32],
     pub timestamp: i64,
     pub record_hash: [u8; 32],
+    /// Ed25519 signature by the vault admin over `record_hash`. This is
+    /// what lets a peer trust that a change genuinely came from the
+    /// admin, without ever seeing the admin's password.
+    pub signature: [u8; SIGNATURE_LEN],
 }
 
 impl ChainRecord {
-    /// Computes `record_hash` and returns a fully-formed record.
-    pub fn new(
-        seq: u64,
-        prev_hash: [u8; 32],
-        op: ChainOp,
-        target_id: u128,
-        data_hash: [u8; 32],
-        timestamp: i64,
-    ) -> Self {
-        let record_hash = Self::compute_hash(seq, &prev_hash, op, target_id, &data_hash, timestamp);
-        ChainRecord { seq, prev_hash, op, target_id, data_hash, timestamp, record_hash }
-    }
-
     pub fn compute_hash(
         seq: u64,
         prev_hash: &[u8; 32],
@@ -559,6 +706,21 @@ impl ChainRecord {
         ])
     }
 
+    /// Builds and signs a new record with the given admin identity.
+    pub fn new_signed(
+        seq: u64,
+        prev_hash: [u8; 32],
+        op: ChainOp,
+        target_id: u128,
+        data_hash: [u8; 32],
+        timestamp: i64,
+        signer: &Identity,
+    ) -> Self {
+        let record_hash = Self::compute_hash(seq, &prev_hash, op, target_id, &data_hash, timestamp);
+        let signature = signer.sign(&record_hash);
+        ChainRecord { seq, prev_hash, op, target_id, data_hash, timestamp, record_hash, signature }
+    }
+
     pub fn verify_self(&self) -> bool {
         let expected = Self::compute_hash(
             self.seq,
@@ -571,6 +733,11 @@ impl ChainRecord {
         expected == self.record_hash
     }
 
+    /// Verifies the admin's signature over this record's hash.
+    pub fn verify_signature(&self, admin_signing_pubkey: &[u8; SIGNING_PUBLIC_LEN]) -> Result<()> {
+        super::identity::verify_signature(admin_signing_pubkey, &self.record_hash, &self.signature)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(CHAIN_RECORD_SIZE as usize);
         w.u64(self.seq);
@@ -580,6 +747,7 @@ impl ChainRecord {
         w.fixed(&self.data_hash, 32);
         w.i64(self.timestamp);
         w.fixed(&self.record_hash, 32);
+        w.fixed(&self.signature, SIGNATURE_LEN);
         // occupied marker so an all-zero slot reads back as "unused, seq 0
         // with no record" rather than a valid-looking record.
         w.u8(1);
@@ -601,28 +769,32 @@ impl ChainRecord {
         let data_hash = r.array32()?;
         let timestamp = r.i64()?;
         let record_hash = r.array32()?;
+        let signature = r.array64()?;
         let occupied = r.u8()?;
         if occupied == 0 {
             return Ok(None);
         }
         let op = ChainOp::from_u8(op_byte)?;
-        Ok(Some(ChainRecord { seq, prev_hash, op, target_id, data_hash, timestamp, record_hash }))
+        Ok(Some(ChainRecord { seq, prev_hash, op, target_id, data_hash, timestamp, record_hash, signature }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::identity::Identity;
 
     fn sample_header() -> Header {
         let block_size = DEFAULT_BLOCK_SIZE;
         let block_count = 16u64;
         let bitmap_len = 8u64;
         let file_table_len = (4 * ENTRY_SIZE) as u64;
+        let recipient_len = (MAX_RECIPIENTS * RECIPIENT_SLOT_SIZE) as u64;
         let chain_len = (4 * CHAIN_RECORD_SIZE) as u64;
         let bitmap_offset = HEADER_SIZE;
         let file_table_offset = bitmap_offset + bitmap_len;
-        let chain_offset = file_table_offset + file_table_len;
+        let recipient_offset = file_table_offset + file_table_len;
+        let chain_offset = recipient_offset + recipient_len;
         let data_offset = chain_offset + chain_len;
         Header {
             version: FORMAT_VERSION,
@@ -637,13 +809,19 @@ mod tests {
             argon2_m_cost_kib: 19 * 1024,
             argon2_t_cost: 2,
             argon2_p_cost: 1,
-            verifier_blob: vec![1, 2, 3, 4],
+            admin_key_slot: vec![1, 2, 3, 4],
+            admin_signing_pubkey: [5u8; 32],
+            admin_encryption_pubkey: [6u8; 32],
             bitmap_offset,
             bitmap_len,
             file_table_offset,
             file_table_len,
             max_files: 4,
             entry_size: ENTRY_SIZE,
+            recipient_offset,
+            recipient_len,
+            max_recipients: MAX_RECIPIENTS,
+            recipient_slot_size: RECIPIENT_SLOT_SIZE,
             chain_offset,
             chain_len,
             max_chain_records: 4,
@@ -664,6 +842,7 @@ mod tests {
         assert_eq!(decoded.description, "a test vault");
         assert_eq!(decoded.block_count, 16);
         assert_eq!(decoded.data_offset, h.data_offset);
+        assert_eq!(decoded.admin_signing_pubkey, [5u8; 32]);
     }
 
     #[test]
@@ -751,14 +930,64 @@ mod tests {
     }
 
     #[test]
-    fn chain_record_roundtrip_and_self_verify() {
-        let rec = ChainRecord::new(1, [0u8; 32], ChainOp::FileAdded, 42, [9u8; 32], 12345);
+    fn recipient_slot_roundtrip() {
+        let slot = RecipientSlot {
+            signing_pubkey: [1u8; 32],
+            encryption_pubkey: [2u8; 32],
+            wrapped_dek: vec![9u8; super::super::crypto::WRAPPED_DEK_LEN],
+            granted_at: 12345,
+            flags: RECIPIENT_FLAG_OCCUPIED,
+        };
+        let encoded = slot.encode();
+        assert_eq!(encoded.len() as u32, RECIPIENT_SLOT_SIZE);
+        let decoded = RecipientSlot::decode(&encoded).unwrap();
+        assert_eq!(decoded.signing_pubkey, [1u8; 32]);
+        assert_eq!(decoded.wrapped_dek.len(), super::super::crypto::WRAPPED_DEK_LEN);
+        assert!(decoded.is_occupied());
+    }
+
+    #[test]
+    fn empty_recipient_slot_is_not_occupied() {
+        let slot = RecipientSlot::empty_slot();
+        let decoded = RecipientSlot::decode(&slot).unwrap();
+        assert!(!decoded.is_occupied());
+    }
+
+    #[test]
+    fn recipient_slot_rejects_checksum_tampering() {
+        let slot = RecipientSlot {
+            signing_pubkey: [1u8; 32],
+            encryption_pubkey: [2u8; 32],
+            wrapped_dek: vec![9u8; super::super::crypto::WRAPPED_DEK_LEN],
+            granted_at: 1,
+            flags: RECIPIENT_FLAG_OCCUPIED,
+        };
+        let mut encoded = slot.encode();
+        encoded[10] ^= 0xFF;
+        assert!(matches!(RecipientSlot::decode(&encoded), Err(VaultError::ChecksumMismatch(_))));
+    }
+
+    #[test]
+    fn chain_record_roundtrip_self_verify_and_signature() {
+        let admin = Identity::generate();
+        let rec = ChainRecord::new_signed(1, [0u8; 32], ChainOp::FileAdded, 42, [9u8; 32], 12345, &admin);
         assert!(rec.verify_self());
+        assert!(rec.verify_signature(&admin.peer_id().signing_public).is_ok());
+
         let encoded = rec.encode();
         assert_eq!(encoded.len() as u32, CHAIN_RECORD_SIZE);
         let decoded = ChainRecord::decode(&encoded).unwrap().unwrap();
         assert_eq!(decoded.seq, 1);
         assert!(decoded.verify_self());
+        assert!(decoded.verify_signature(&admin.peer_id().signing_public).is_ok());
+    }
+
+    #[test]
+    fn chain_record_signature_rejects_wrong_signer() {
+        let admin = Identity::generate();
+        let impostor = Identity::generate();
+        let rec = ChainRecord::new_signed(1, [0u8; 32], ChainOp::FileAdded, 42, [9u8; 32], 12345, &admin);
+        assert!(rec.verify_signature(&impostor.peer_id().signing_public).is_err());
     }
 
     #[test]
@@ -769,7 +998,8 @@ mod tests {
 
     #[test]
     fn chain_record_detects_tampering() {
-        let mut rec = ChainRecord::new(1, [0u8; 32], ChainOp::FileAdded, 42, [9u8; 32], 12345);
+        let admin = Identity::generate();
+        let mut rec = ChainRecord::new_signed(1, [0u8; 32], ChainOp::FileAdded, 42, [9u8; 32], 12345, &admin);
         rec.data_hash[0] ^= 0xFF; // simulate corruption without recomputing hash
         assert!(!rec.verify_self());
     }

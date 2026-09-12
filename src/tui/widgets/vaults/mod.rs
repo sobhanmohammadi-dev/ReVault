@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 
-use crate::core::{self, VaultError};
+use crate::core::{self, Identity, VaultError};
 use crate::tui::log;
 
 use create::{CreateForm, CreateOutcome};
@@ -41,6 +41,11 @@ pub struct App {
     pub listing: Vec<VaultListing>,
     pub selected: usize,
     pub mode: Mode,
+    /// This device's local identity. For a freshly created vault this
+    /// becomes the vault's admin identity; for an existing vault, whether
+    /// it grants admin rights depends on whether it matches the identity
+    /// recorded at that vault's creation time.
+    identity: Identity,
 }
 
 fn scan_vaults_dir(dir: &Path) -> Vec<VaultListing> {
@@ -125,7 +130,12 @@ fn unique_vault_path(dir: &Path, name: &str) -> PathBuf {
 impl App {
     pub fn new_with_dir(vaults_dir: PathBuf) -> Self {
         let listing = scan_vaults_dir(&vaults_dir);
-        App { vaults_dir, listing, selected: 0, mode: Mode::Browsing }
+        // Best-effort: if the identity file can't be read/written for some
+        // reason, fall back to an in-memory identity for this session
+        // rather than crashing the whole app -- it just means this
+        // session won't have durable admin rights across restarts.
+        let identity = Identity::load_or_create().unwrap_or_else(|_| Identity::generate());
+        App { vaults_dir, listing, selected: 0, mode: Mode::Browsing, identity }
     }
 
     pub fn refresh(&mut self) {
@@ -166,7 +176,8 @@ impl App {
         let capacity_bytes = parse_capacity(&form.capacity)?;
         std::fs::create_dir_all(&self.vaults_dir).map_err(|e| e.to_string())?;
         let path = unique_vault_path(&self.vaults_dir, name);
-        core::Vault::create(&path, name, form.description.trim(), capacity_bytes, &form.password)
+        let admin_identity = Identity::from_bytes(&self.identity.to_bytes());
+        core::Vault::create(&path, name, form.description.trim(), capacity_bytes, &form.password, admin_identity)
             .map_err(|e| e.to_string())?;
         log::log_event(&format!("vault created: {name}"));
         Ok(())
@@ -223,21 +234,24 @@ impl App {
 
             Mode::Unlocking(mut form, path, name) => match unlock::handle_key(&mut form, key) {
                 Some(UnlockOutcome::Cancel) => Mode::Browsing,
-                Some(UnlockOutcome::Submit) => match core::Vault::open(&path, &form.password) {
-                    Ok(vault) => {
-                        log::log_event(&format!("vault unlocked: {name}"));
-                        Mode::Unlocked(UnlockedState::new(vault, path, name))
+                Some(UnlockOutcome::Submit) => {
+                    let local_identity = Identity::from_bytes(&self.identity.to_bytes());
+                    match core::Vault::open(&path, &form.password, local_identity) {
+                        Ok(vault) => {
+                            log::log_event(&format!("vault unlocked: {name}"));
+                            Mode::Unlocked(UnlockedState::new(vault, path, name))
+                        }
+                        Err(VaultError::IncorrectPassword) => {
+                            form.password.clear();
+                            form.error = Some("Incorrect password".to_string());
+                            Mode::Unlocking(form, path, name)
+                        }
+                        Err(e) => {
+                            form.error = Some(e.to_string());
+                            Mode::Unlocking(form, path, name)
+                        }
                     }
-                    Err(VaultError::IncorrectPassword) => {
-                        form.password.clear();
-                        form.error = Some("Incorrect password".to_string());
-                        Mode::Unlocking(form, path, name)
-                    }
-                    Err(e) => {
-                        form.error = Some(e.to_string());
-                        Mode::Unlocking(form, path, name)
-                    }
-                },
+                }
                 None => Mode::Unlocking(form, path, name),
             },
 

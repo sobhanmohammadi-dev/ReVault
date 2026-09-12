@@ -15,7 +15,9 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use argon2::{Argon2, Params, Version};
 use rand::RngCore;
+use rand_core_06::OsRng as OsRng06;
 use sha2::{Digest, Sha256};
+use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::error::{Result, VaultError};
@@ -146,6 +148,86 @@ impl MasterKey {
     }
 }
 
+impl MasterKey {
+    /// Wraps an already-derived 32-byte key (used for the vault's actual
+    /// content key -- the DEK -- as opposed to a password-derived KEK).
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        MasterKey(bytes)
+    }
+
+    /// Exposes the raw key bytes. Used only to wrap the DEK for a newly
+    /// granted recipient (see [`wrap_dek_for_recipient`]) -- never logged,
+    /// never written to disk in the clear.
+    pub fn expose_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+}
+
+pub const WRAPPED_DEK_LEN: usize = 32 /* ephemeral X25519 pubkey */ + NONCE_LEN + KEY_LEN + TAG_LEN;
+
+/// Derives a symmetric wrapping key from an X25519 shared secret.
+///
+/// This is a single-step SHA-256-based KDF, not a formal HKDF. That's an
+/// intentional, documented simplification for the "small trusted set of
+/// devices" threat model this targets, to avoid pulling in another crate
+/// whose exact API we can't verify without a compiler in this
+/// environment. Swap in a proper HKDF (e.g. the `hkdf` crate) before
+/// this is ever exposed to a broader / adversarial network.
+fn derive_wrap_key(shared_secret: &[u8]) -> [u8; KEY_LEN] {
+    sha256_concat(&[shared_secret, b"revault-dek-wrap-v1"])
+}
+
+/// Wraps a vault's DEK for a specific recipient's X25519 public key, so
+/// only that recipient's matching private key can recover it. Uses a
+/// fresh ephemeral keypair per call (the ephemeral public key travels
+/// alongside the ciphertext so the recipient can redo the same
+/// Diffie-Hellman on their side) -- a minimal ECIES-style construction
+/// built from well-maintained primitives (X25519 + AES-256-GCM), not a
+/// custom cryptographic algorithm.
+pub fn wrap_dek_for_recipient(recipient_encryption_pub: &[u8; 32], dek: &[u8; KEY_LEN]) -> Result<[u8; WRAPPED_DEK_LEN]> {
+    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng06);
+    let ephemeral_public = XPublicKey::from(&ephemeral_secret);
+    let recipient_public = XPublicKey::from(*recipient_encryption_pub);
+    let shared = ephemeral_secret.diffie_hellman(&recipient_public);
+    let wrap_key = derive_wrap_key(shared.as_bytes());
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key));
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), dek.as_slice())
+        .map_err(|_| VaultError::CryptoFailure)?;
+
+    let mut out = [0u8; WRAPPED_DEK_LEN];
+    out[..32].copy_from_slice(ephemeral_public.as_bytes());
+    out[32..32 + NONCE_LEN].copy_from_slice(&nonce_bytes);
+    out[32 + NONCE_LEN..].copy_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// The recipient-side counterpart of [`wrap_dek_for_recipient`].
+pub fn unwrap_dek_for_recipient(recipient_secret: &StaticSecret, wrapped: &[u8; WRAPPED_DEK_LEN]) -> Result<[u8; KEY_LEN]> {
+    let mut ephemeral_pub_bytes = [0u8; 32];
+    ephemeral_pub_bytes.copy_from_slice(&wrapped[..32]);
+    let ephemeral_public = XPublicKey::from(ephemeral_pub_bytes);
+
+    let nonce_bytes = &wrapped[32..32 + NONCE_LEN];
+    let ciphertext = &wrapped[32 + NONCE_LEN..];
+
+    let shared = recipient_secret.diffie_hellman(&ephemeral_public);
+    let wrap_key = derive_wrap_key(shared.as_bytes());
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .map_err(|_| VaultError::AccessNotGranted)?;
+    if plaintext.len() != KEY_LEN {
+        return Err(VaultError::CorruptContainer("unwrapped DEK has the wrong length"));
+    }
+    let mut dek = [0u8; KEY_LEN];
+    dek.copy_from_slice(&plaintext);
+    Ok(dek)
+}
+
 pub fn random_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut salt);
@@ -261,5 +343,37 @@ mod tests {
         let last = ct.len() - 1;
         ct[last] ^= 0x01;
         assert!(key.decrypt_block(1, 0, &ct).is_err());
+    }
+
+    #[test]
+    fn wrap_and_unwrap_dek_roundtrip() {
+        let recipient_secret = StaticSecret::random_from_rng(&mut OsRng06);
+        let recipient_public = *XPublicKey::from(&recipient_secret).as_bytes();
+        let dek = [42u8; KEY_LEN];
+
+        let wrapped = wrap_dek_for_recipient(&recipient_public, &dek).unwrap();
+        let unwrapped = unwrap_dek_for_recipient(&recipient_secret, &wrapped).unwrap();
+        assert_eq!(unwrapped, dek);
+    }
+
+    #[test]
+    fn unwrap_fails_for_wrong_recipient() {
+        let real_recipient = StaticSecret::random_from_rng(&mut OsRng06);
+        let real_public = *XPublicKey::from(&real_recipient).as_bytes();
+        let dek = [7u8; KEY_LEN];
+        let wrapped = wrap_dek_for_recipient(&real_public, &dek).unwrap();
+
+        let attacker_secret = StaticSecret::random_from_rng(&mut OsRng06);
+        assert!(unwrap_dek_for_recipient(&attacker_secret, &wrapped).is_err());
+    }
+
+    #[test]
+    fn wrap_produces_different_ciphertext_each_time() {
+        let recipient_secret = StaticSecret::random_from_rng(&mut OsRng06);
+        let recipient_public = *XPublicKey::from(&recipient_secret).as_bytes();
+        let dek = [9u8; KEY_LEN];
+        let a = wrap_dek_for_recipient(&recipient_public, &dek).unwrap();
+        let b = wrap_dek_for_recipient(&recipient_public, &dek).unwrap();
+        assert_ne!(a, b, "fresh ephemeral key + nonce should differ each call");
     }
 }

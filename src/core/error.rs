@@ -52,6 +52,18 @@ pub enum VaultError {
 
     #[error("vault is locked; unlock it with the correct password first")]
     VaultLocked,
+
+    #[error("this vault was opened without admin privileges; only the vault's admin can modify it")]
+    NotAuthorized,
+
+    #[error("no matching recipient access was found for this identity")]
+    AccessNotGranted,
+
+    #[error("this identity already has access to the vault")]
+    AlreadyGranted,
+
+    #[error("recipient table is full; revoke an existing peer before granting a new one")]
+    RecipientTableFull,
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
