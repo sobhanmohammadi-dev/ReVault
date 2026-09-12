@@ -1,4 +1,5 @@
 use std::io;
+use std::time::Duration;
 
 use crossterm::event;
 
@@ -20,11 +21,19 @@ impl Start {
                     ui::render(frame, &app);
                 })?;
 
-                if let Some(key) = event::read()?.as_key_press_event() {
-                    if handle_key(&mut app, key) {
-                        break Ok(());
+                // Poll instead of blocking so the loop wakes up
+                // periodically even with no input -- required to enforce
+                // the 30s inactivity timeout on wall-clock time rather
+                // than only re-checking it on the next key press.
+                if event::poll(Duration::from_millis(200))? {
+                    if let Some(key) = event::read()?.as_key_press_event() {
+                        if handle_key(&mut app, key) {
+                            break Ok(());
+                        }
                     }
                 }
+
+                app.tick();
             }
         })
     }

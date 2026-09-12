@@ -1,0 +1,268 @@
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
+    text::Line,
+    widgets::{Block, Borders, Paragraph, Row, Table},
+    Frame,
+};
+
+use crate::core::{self, Session};
+use crate::tui::log;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddField {
+    Source,
+    Dest,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AddFileForm {
+    pub source_path: String,
+    pub dest_name: String,
+    pub focus_dest: bool,
+    pub error: Option<String>,
+}
+
+pub struct UnlockedState {
+    pub vault: core::Vault,
+    pub path: PathBuf,
+    pub name: String,
+    pub files: Vec<core::FileInfo>,
+    pub selected: usize,
+    pub session: Session,
+    pub message: Option<String>,
+    pub add_form: Option<AddFileForm>,
+}
+
+impl UnlockedState {
+    pub fn new(vault: core::Vault, path: PathBuf, name: String) -> Self {
+        let mut state = UnlockedState {
+            vault,
+            path,
+            name,
+            files: Vec::new(),
+            selected: 0,
+            session: Session::new(),
+            message: None,
+            add_form: None,
+        };
+        state.refresh_files();
+        state
+    }
+
+    fn refresh_files(&mut self) {
+        match self.vault.list_files() {
+            Ok(files) => {
+                self.files = files;
+                if self.selected >= self.files.len() {
+                    self.selected = self.files.len().saturating_sub(1);
+                }
+            }
+            Err(e) => self.message = Some(format!("Failed to list files: {e}")),
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.files.is_empty() {
+            return;
+        }
+        let len = self.files.len() as i32;
+        let mut idx = self.selected as i32 + delta;
+        if idx < 0 {
+            idx = 0;
+        } else if idx >= len {
+            idx = len - 1;
+        }
+        self.selected = idx as usize;
+    }
+
+    fn start_add(&mut self) {
+        self.add_form = Some(AddFileForm::default());
+    }
+
+    fn submit_add(&mut self) {
+        let Some(form) = self.add_form.clone() else { return };
+        if form.source_path.trim().is_empty() || form.dest_name.trim().is_empty() {
+            if let Some(f) = &mut self.add_form {
+                f.error = Some("Both fields are required".to_string());
+            }
+            return;
+        }
+        let data = match std::fs::read(form.source_path.trim()) {
+            Ok(d) => d,
+            Err(e) => {
+                if let Some(f) = &mut self.add_form {
+                    f.error = Some(format!("Could not read source file: {e}"));
+                }
+                return;
+            }
+        };
+        match self.vault.add_file(form.dest_name.trim(), &data) {
+            Ok(()) => {
+                log::log_event(&format!("file added to vault \"{}\": {}", self.name, form.dest_name.trim()));
+                self.refresh_files();
+                self.add_form = None;
+                self.message = Some(format!("Added \"{}\"", form.dest_name.trim()));
+            }
+            Err(e) => {
+                if let Some(f) = &mut self.add_form {
+                    f.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        let Some(file) = self.files.get(self.selected).cloned() else { return };
+        match self.vault.delete_file(&file.name) {
+            Ok(()) => {
+                log::log_event(&format!("file deleted from vault \"{}\": {}", self.name, file.name));
+                self.refresh_files();
+                self.message = Some(format!("Deleted \"{}\"", file.name));
+            }
+            Err(e) => self.message = Some(e.to_string()),
+        }
+    }
+
+    fn verify(&mut self) {
+        match self.vault.verify_integrity() {
+            Ok(()) => self.message = Some("Integrity check passed.".to_string()),
+            Err(e) => self.message = Some(format!("Integrity check FAILED: {e}")),
+        }
+    }
+}
+
+pub enum Outcome {
+    Continue,
+    Lock,
+}
+
+pub fn handle_key(state: &mut UnlockedState, key: KeyEvent) -> Outcome {
+    // Any interaction while unlocked resets the 30s inactivity timer.
+    state.session.record_activity();
+
+    if let Some(form) = &mut state.add_form {
+        match key.code {
+            KeyCode::Esc => {
+                state.add_form = None;
+            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                form.focus_dest = !form.focus_dest;
+            }
+            KeyCode::Enter => {
+                if form.focus_dest {
+                    state.submit_add();
+                } else {
+                    form.focus_dest = true;
+                }
+            }
+            KeyCode::Backspace => {
+                if form.focus_dest {
+                    form.dest_name.pop();
+                } else {
+                    form.source_path.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if form.focus_dest {
+                    form.dest_name.push(c);
+                } else {
+                    form.source_path.push(c);
+                }
+            }
+            _ => {}
+        }
+        return Outcome::Continue;
+    }
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return Outcome::Lock,
+        KeyCode::Up => state.move_selection(-1),
+        KeyCode::Down => state.move_selection(1),
+        KeyCode::Char('a') => state.start_add(),
+        KeyCode::Char('d') => state.delete_selected(),
+        KeyCode::Char('v') => state.verify(),
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+pub fn render(frame: &mut Frame, area: Rect, state: &UnlockedState) {
+    if let Some(form) = &state.add_form {
+        render_add_form(frame, area, form);
+        return;
+    }
+
+    let layout = Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]);
+    let [title_a, table_a, message_a] = area.layout(&layout);
+
+    let title = Paragraph::new(Line::from(format!(
+        "{}  ({} used of {})",
+        state.name,
+        format_bytes(state.vault.used_bytes()),
+        format_bytes(state.vault.capacity_bytes())
+    )));
+    frame.render_widget(title, title_a);
+
+    let header = Row::new(["Name", "Size", "Modified"]).style(Style::new().bold()).bottom_margin(1);
+    let rows: Vec<Row> = state
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let style = if i == state.selected {
+                Style::default().fg(Color::Rgb(255, 140, 0))
+            } else {
+                Style::default()
+            };
+            Row::new([f.name.clone(), format_bytes(f.size), f.modified_at.to_string()]).style(style)
+        })
+        .collect();
+    let table = Table::new(rows, [Constraint::Length(30), Constraint::Length(12), Constraint::Length(16)]).header(header);
+    frame.render_widget(table, table_a);
+
+    if let Some(msg) = &state.message {
+        let message = Paragraph::new(Line::from(msg.as_str()));
+        frame.render_widget(message, message_a);
+    }
+}
+
+fn render_add_form(frame: &mut Frame, area: Rect, form: &AddFileForm) {
+    let layout = Layout::vertical([Constraint::Length(3), Constraint::Length(3), Constraint::Fill(1)]);
+    let [source_a, dest_a, error_a] = area.layout(&layout);
+
+    let source_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Source file path on disk ")
+        .border_style(if form.focus_dest { Style::default() } else { Style::default().fg(Color::Rgb(255, 140, 0)) });
+    frame.render_widget(Paragraph::new(Line::from(form.source_path.as_str())).block(source_block), source_a);
+
+    let dest_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Name inside vault ")
+        .border_style(if form.focus_dest { Style::default().fg(Color::Rgb(255, 140, 0)) } else { Style::default() });
+    frame.render_widget(Paragraph::new(Line::from(form.dest_name.as_str())).block(dest_block), dest_a);
+
+    if let Some(err) = &form.error {
+        let error_line = Paragraph::new(Line::from(err.as_str())).style(Style::default().fg(Color::Red));
+        frame.render_widget(error_line, error_a);
+    }
+}

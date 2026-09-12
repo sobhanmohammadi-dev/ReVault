@@ -1,26 +1,29 @@
 use ratatui::{
     layout::{Alignment, Rect},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::tui::tab::Tab;
+use crate::tui::{app::App, tab::Tab};
 
-pub fn render(frame: &mut Frame, area: Rect, selected_tab: Tab) {
-    let tab = match selected_tab {
+pub fn render(frame: &mut Frame, area: Rect, app: &App) {
+    match app.selected_tab {
         Tab::Vaults => {
-            crate::tui::widgets::vaults::table::render(frame, area)
+            app.vaults.render(frame, area);
         }
 
         Tab::Network => {
-            crate::tui::widgets::vaults::table::render(frame, area)
+            let placeholder = Paragraph::new("Network features are coming in a future release.")
+                .alignment(Alignment::Center);
+            frame.render_widget(placeholder, area);
         }
 
         Tab::Logs => {
-            crate::tui::widgets::vaults::table::render(frame, area)
+            crate::tui::widgets::logs::render(frame, area);
         }
+
         Tab::Settings => {
-            crate::tui::widgets::vaults::table::render(frame, area)
+            crate::tui::widgets::settings::render(frame, area, &app.settings_ui, &app.settings);
         }
-    };
+    }
 }

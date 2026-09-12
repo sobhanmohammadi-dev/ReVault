@@ -40,5 +40,5 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 
     // Render content inside the border
     let inner_area = content_block.inner(content_area);
-    content::render(frame, inner_area, app.selected_tab);
+    content::render(frame, inner_area, app);
 }

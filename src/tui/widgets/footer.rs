@@ -4,32 +4,23 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::{
-    app::App,
-    tab::Tab,
-};
+use crate::tui::{app::App, tab::Tab};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let text = match (app.locked, app.selected_tab) {
-        (false, _) => {
-            "Press 'q' to quit, '↹' to navigate tabs, '↵' to select tab."
-        }
+    let blocking = app.blocks_global_nav();
+
+    let text = match (blocking, app.selected_tab) {
+        (false, _) => "Press 'q' to quit, '↹' to navigate tabs, '↵' to select.",
 
         (true, Tab::Vaults) => {
-            "Press 'q' to exit vaults, '⬇⬆' to navigate vaults, '+' to create a new Vault."
+            "Press 'q'/Esc to go back, '⬇⬆' to navigate, '↵' to select, '+' new vault, 'a' add file, 'd' delete file, 'v' verify."
         }
 
-        (true, Tab::Network) => {
-            "Press 'q' to exit Network, '⬇⬆' to navigate networks."
-        }
+        (true, Tab::Network) => "Press 'q' to exit Network, '⬇⬆' to navigate networks.",
 
-        (true, Tab::Logs) => {
-            "Press 'q' to exit Logs, '⬇⬆' to navigate logs."
-        },
+        (true, Tab::Logs) => "Press 'q' to exit Logs, '⬇⬆' to navigate logs.",
 
-        (true, Tab::Settings) => {
-            "Press 'q to exit Settings, '⬇⬆' to navigate settings, '↵' to select tab."
-        }
+        (true, Tab::Settings) => "Press ↵ to save, Esc to cancel.",
     };
 
     let footer = Paragraph::new(text).centered();
