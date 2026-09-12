@@ -9,7 +9,7 @@ use ratatui::{
 use crate::tui::tab::Tab;
 
 pub fn render(frame: &mut Frame, area: Rect, selected_tab: Tab) {
-    let titles = ["Vaults", "Network", "Logs", "Settings"];
+    let titles = ["vaults", "Network", "Logs", "Settings"];
 
     let tabs = Tabs::new(
         titles

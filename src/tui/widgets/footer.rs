@@ -16,7 +16,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         (true, Tab::Vaults) => {
-            "Press 'q' to exit Vaults, '⬇⬆' to navigate vaults, '+' to create a new Vault."
+            "Press 'q' to exit vaults, '⬇⬆' to navigate vaults, '+' to create a new Vault."
         }
 
         (true, Tab::Network) => {

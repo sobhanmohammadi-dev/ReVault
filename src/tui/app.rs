@@ -1,8 +1,11 @@
+use crate::tui;
 use crate::tui::tab::Tab;
+use crate::tui::widgets::vaults::{App as VaultApp, Vaultmode};
 
 pub struct App {
     pub selected_tab: Tab,
     pub locked: bool,
+    pub vaults: VaultApp,
 }
 
 impl App {
@@ -10,6 +13,7 @@ impl App {
         Self {
             selected_tab: Tab::Vaults,
             locked: false,
+            vaults: VaultApp::new(),
         }
     }
 
@@ -31,5 +35,9 @@ impl App {
 
     pub fn index(&self) -> usize {
         self.selected_tab.index()
+    }
+
+    pub fn vaults(&self) -> Option<&Vaultmode> {
+        self.vaults.mode.as_ref()
     }
 }

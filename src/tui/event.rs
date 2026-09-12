@@ -26,7 +26,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         
         KeyCode::Char('+') if app.selected_tab == Tab::Vaults => {
-            
+            app.vaults.create();
         }
 
         _ => {}
