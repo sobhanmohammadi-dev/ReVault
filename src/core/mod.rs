@@ -13,4 +13,4 @@ pub mod vault;
 pub use error::{Result, VaultError};
 pub use identity::{Identity, PeerId};
 pub use session::Session;
-pub use vault::{FileInfo, Vault, VaultSummary};
+pub use vault::{FileInfo, RecipientInfo, Vault, VaultSummary};

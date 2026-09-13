@@ -13,7 +13,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         (false, _) => "Press 'q' to quit, '↹' to navigate tabs, '↵' to select.",
 
         (true, Tab::Vaults) => {
-            "Press 'q'/Esc to go back, '⬇⬆' to navigate, '↵' to select, '+' new vault, 'a' add file, 'd' delete file, 'v' verify."
+            "Press 'q'/Esc to go back, '⬇⬆' to navigate, '↵' to select, '+' new vault, 'a' add file, 'd' delete file, 'v' verify, 'p' peers."
         }
 
         (true, Tab::Network) => "Press 'q' to exit Network, '⬇⬆' to navigate networks.",
