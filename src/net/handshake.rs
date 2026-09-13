@@ -17,6 +17,7 @@
 //! NOTE: like the rest of the network layer, this has not been compiled
 //! in this environment -- see the crate-level caveats in
 //! `docs/ARCHITECTURE_NETWORK.md`.
+#![allow(deprecated)] // Key/Nonce::from_slice: cosmetic, not a soundness issue
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};

@@ -10,6 +10,12 @@
 //! No custom cryptography is implemented here; this module only wires
 //! together well-maintained crates and is careful about key/plaintext
 //! lifetime and never appearing in `Debug`/logs.
+//!
+//! `Key::from_slice`/`Nonce::from_slice` are deprecated in favor of
+//! `TryFrom` as of a recent `aes-gcm` point release; both still work
+//! and this is a cosmetic warning, not a soundness issue, so it's
+//! silenced here rather than churning every call site.
+#![allow(deprecated)]
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -18,7 +24,7 @@ use rand::RngCore;
 use rand_core_06::OsRng as OsRng06;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 use super::error::{Result, VaultError};
 

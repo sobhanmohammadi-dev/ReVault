@@ -46,7 +46,7 @@ rand = "0.9"
 # We pull rand_core 0.6 in explicitly, only for its OsRng, and only at the
 # few call sites that generate dalek keypairs -- everything else in the
 # codebase keeps using `rand` 0.9 as before.
-rand_core_06 = { package = "rand_core", version = "0.6" }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 
 # Secret / Key Memory Protection
 zeroize = { version = "1", features = ["derive"] }

@@ -109,6 +109,20 @@ pub struct Vault {
     change_log: Vec<(u64, Vec<u8>)>,
 }
 
+impl std::fmt::Debug for Vault {
+    /// Hand-written rather than derived: `MasterKey` deliberately does
+    /// not implement `Debug` (so the content key can never end up in a
+    /// log/panic message by accident), so a derive here isn't possible
+    /// without weakening that guarantee. This redacted view is enough
+    /// for `Result::unwrap_err` in tests and any other debug printing.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault")
+            .field("name", &self.header.name)
+            .field("is_admin", &self.is_admin())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Vault {
     // -----------------------------------------------------------------
     // Creation / opening
@@ -379,6 +393,13 @@ impl Vault {
     /// (i.e. mutating methods will work).
     pub fn is_admin(&self) -> bool {
         self.admin_identity.is_some()
+    }
+
+    /// The vault's current chain position: `(next_seq, last_hash)`. This
+    /// is exactly what a peer sends as `SyncMessage::ChainState` to
+    /// report how caught-up they are.
+    pub fn chain_state(&self) -> (u64, [u8; 32]) {
+        (self.header.chain_next_seq, self.header.chain_last_hash)
     }
 
     fn require_admin(&self) -> Result<()> {
