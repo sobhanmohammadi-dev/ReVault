@@ -99,6 +99,14 @@ pub struct Vault {
     /// matches the header's recorded admin identity. Mutating methods
     /// require this.
     admin_identity: Option<Identity>,
+    /// Every `(offset, bytes)` range written by a mutating call since the
+    /// last [`Vault::take_change_log`]. This is the foundation of the
+    /// network sync protocol: since a peer's local replica starts as a
+    /// byte-identical copy of this file, shipping exactly the ranges that
+    /// changed -- and replaying them verbatim -- reproduces the same
+    /// mutation on the peer's copy without needing any operation-specific
+    /// sync logic.
+    change_log: Vec<(u64, Vec<u8>)>,
 }
 
 impl Vault {
@@ -261,7 +269,7 @@ impl Vault {
 
         file.flush()?;
 
-        Ok(Vault { file, header, allocator, key: content_key, admin_identity: Some(admin_identity) })
+        Ok(Vault { file, header, allocator, key: content_key, admin_identity: Some(admin_identity), change_log: Vec::new() })
     }
 
     /// Opens a vault as its admin, using the password. `local_identity`
@@ -305,7 +313,7 @@ impl Vault {
         file.read_exact(&mut bitmap_buf)?;
         let allocator = BlockAllocator::from_bytes(bitmap_buf, header.block_count);
 
-        Ok(Vault { file, header, allocator, key: content_key, admin_identity })
+        Ok(Vault { file, header, allocator, key: content_key, admin_identity, change_log: Vec::new() })
     }
 
     /// Opens a vault as a granted peer (no password): looks up
@@ -347,7 +355,7 @@ impl Vault {
         file.read_exact(&mut bitmap_buf)?;
         let allocator = BlockAllocator::from_bytes(bitmap_buf, header.block_count);
 
-        Ok(Vault { file, header, allocator, key: content_key, admin_identity: None })
+        Ok(Vault { file, header, allocator, key: content_key, admin_identity: None, change_log: Vec::new() })
     }
 
     pub fn summary(&self) -> VaultSummary {
@@ -385,16 +393,71 @@ impl Vault {
     // Low-level region I/O
     // -----------------------------------------------------------------
 
-    fn write_header(&mut self) -> Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&self.header.encode())?;
+    /// Writes `data` at `offset` and records the range in the change log.
+    /// Every on-disk mutation in this module funnels through here (or
+    /// through `write_physical_block`, which calls this) so the change
+    /// log always reflects exactly what changed on disk.
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        self.change_log.push((offset, data.to_vec()));
         Ok(())
     }
 
-    fn write_bitmap(&mut self) -> Result<()> {
+    /// Drains and returns every byte range written since the last call.
+    /// Intended to be called right after a mutating method (`add_file`,
+    /// `update_file`, `delete_file`, `grant_access`) to get exactly the
+    /// patch that needs shipping to peers over the (future) network
+    /// layer. Not meaningful after `revoke_access`, which rewrites nearly
+    /// the whole file -- send a fresh full copy (see `export_full`)
+    /// instead of a patch in that case.
+    pub fn take_change_log(&mut self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut self.change_log)
+    }
+
+    /// Returns the vault's entire underlying container as bytes, for
+    /// transferring a full initial (or post-rotation) replica to a peer.
+    pub fn export_full(&mut self) -> Result<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut buf = Vec::new();
+        self.file.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Applies a patch produced by [`Vault::take_change_log`] on another
+    /// replica of the same vault: writes each range verbatim, then
+    /// reloads the in-memory header/allocator from disk (they may have
+    /// changed). The content key is untouched, since ordinary patches
+    /// never change the DEK -- only `revoke_access`/`KeyRotated` does,
+    /// which is synced via a full `export_full` transfer instead.
+    pub fn apply_remote_patch(&mut self, ranges: &[(u64, Vec<u8>)]) -> Result<()> {
+        for (offset, data) in ranges {
+            self.file.seek(SeekFrom::Start(*offset))?;
+            self.file.write_all(data)?;
+        }
+        self.file.flush()?;
+
+        let mut header_buf = vec![0u8; HEADER_SIZE as usize];
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.read_exact(&mut header_buf)?;
+        self.header = Header::decode(&header_buf)?;
+
+        let mut bitmap_buf = vec![0u8; self.header.bitmap_len as usize];
         self.file.seek(SeekFrom::Start(self.header.bitmap_offset))?;
-        self.file.write_all(self.allocator.as_bytes())?;
+        self.file.read_exact(&mut bitmap_buf)?;
+        self.allocator = BlockAllocator::from_bytes(bitmap_buf, self.header.block_count);
         Ok(())
+    }
+
+    fn write_header(&mut self) -> Result<()> {
+        let encoded = self.header.encode();
+        self.write_at(0, &encoded)
+    }
+
+    fn write_bitmap(&mut self) -> Result<()> {
+        let offset = self.header.bitmap_offset;
+        let bytes = self.allocator.as_bytes().to_vec();
+        self.write_at(offset, &bytes)
     }
 
     fn slot_offset(&self, idx: u32) -> u64 {
@@ -409,9 +472,9 @@ impl Vault {
     }
 
     fn write_slot(&mut self, idx: u32, entry: &FileEntry) -> Result<()> {
-        self.file.seek(SeekFrom::Start(self.slot_offset(idx)))?;
-        self.file.write_all(&entry.encode())?;
-        Ok(())
+        let offset = self.slot_offset(idx);
+        let encoded = entry.encode();
+        self.write_at(offset, &encoded)
     }
 
     fn recipient_slot_offset(&self, idx: u32) -> u64 {
@@ -426,9 +489,9 @@ impl Vault {
     }
 
     fn write_recipient_slot(&mut self, idx: u32, slot: &RecipientSlot) -> Result<()> {
-        self.file.seek(SeekFrom::Start(self.recipient_slot_offset(idx)))?;
-        self.file.write_all(&slot.encode())?;
-        Ok(())
+        let offset = self.recipient_slot_offset(idx);
+        let encoded = slot.encode();
+        self.write_at(offset, &encoded)
     }
 
     fn chain_slot_offset(&self, seq: u64) -> u64 {
@@ -455,8 +518,8 @@ impl Vault {
             ChainRecord::new_signed(seq, prev_hash, op, target_id, data_hash, now(), admin)
         };
         let offset = self.chain_slot_offset(seq);
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&rec.encode())?;
+        let encoded = rec.encode();
+        self.write_at(offset, &encoded)?;
         self.header.chain_next_seq = seq + 1;
         self.header.chain_last_hash = rec.record_hash;
         self.write_header()
@@ -480,9 +543,7 @@ impl Vault {
         buf[0..4].copy_from_slice(&(plaintext.len() as u32).to_le_bytes());
         buf[4..4 + ciphertext.len()].copy_from_slice(&ciphertext);
         let offset = self.header.data_offset + physical_idx * self.header.block_size as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&buf)?;
-        Ok(())
+        self.write_at(offset, &buf)
     }
 
     fn read_physical_block(&mut self, physical_idx: u64, file_id: u128) -> Result<Vec<u8>> {

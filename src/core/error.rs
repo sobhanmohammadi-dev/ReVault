@@ -64,6 +64,9 @@ pub enum VaultError {
 
     #[error("recipient table is full; revoke an existing peer before granting a new one")]
     RecipientTableFull,
+
+    #[error("remote peer reported an error: {0}")]
+    Remote(String),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
