@@ -12,9 +12,11 @@
 
 pub mod handshake;
 pub mod invite;
+pub mod journal;
 pub mod protocol;
 pub mod sync;
 
 pub use handshake::SecureChannel;
 pub use invite::InviteCode;
+pub use journal::PatchJournal;
 pub use protocol::SyncMessage;

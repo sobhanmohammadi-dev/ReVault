@@ -155,29 +155,48 @@ Implemented: `Identity`/`PeerId`, the full envelope-encryption format
 `revoke_access` with full key rotation, admin-only mutation guards,
 signed/verified chain records, `Vault::open_as_recipient`, a
 byte-range change-log (`take_change_log`/`apply_remote_patch`/
-`export_full`) that the sync protocol is built on, a lightweight
-authenticated+encrypted channel (`net::handshake`, X25519 + Ed25519 +
-AES-256-GCM -- explicitly *not* a formally analyzed protocol like Noise,
-see that module's doc comment), the wire sync protocol
-(`net::protocol`, `net::sync`: join / catch-up / live-push patch),
-hex invite codes (`net::invite`), five CLI subcommands (`whoami`,
-`grant`, `revoke`, `serve`, `join`), and grant/revoke wired into the
+`export_full`), a lightweight authenticated+encrypted channel
+(`net::handshake` -- explicitly *not* a formally analyzed protocol like
+Noise, see that module's doc comment), the wire sync protocol
+(`net::protocol`, `net::sync`), hex invite codes (`net::invite`), a
+bounded in-memory **patch journal** (`net::journal`) so a peer that
+reconnects after missing only a few changes gets an incremental patch
+instead of a full resync, five CLI subcommands (`whoami`, `grant`,
+`revoke`, `serve`, `join`) where **`serve` is now an interactive
+session** -- it accepts peer connections *and* reads admin commands
+(`add`/`update`/`delete`/`list`) from stdin concurrently on one `Vault`
+handle, so mutations made while serving actually populate the journal
+for connected/reconnecting peers -- and grant/revoke wired into the
 Vaults TUI (press `p` on an unlocked vault).
 
-Still deferred:
+**Important safety note**: only one process should hold a given `.rvlt`
+file open at a time. Each `Vault` handle caches its own copy of the
+header/allocator bitmap in memory; two independent processes (e.g.
+running `revault grant` while `revault serve` is also running against
+the same file) writing to the same file concurrently could corrupt it.
+Use `serve`'s own `add`/`update`/`delete` commands instead of a separate
+CLI invocation while a serve session is running. This isn't enforced
+with a file lock yet -- a reasonable next hardening step.
+
+Still deferred, with reasons:
 - **Peer discovery** (DHT/gossip) -- v1 is manual invite codes with an
-  embedded `ip:port` only.
-- **A real Noise handshake** in place of the hand-rolled one.
-- **Efficient catch-up sync** -- reconnecting after being offline always
-  triggers a full resync rather than replaying missed patches, because
-  there's no persistent, seq-indexed patch history kept anywhere yet
-  (documented in `net::sync`). A bounded on-disk patch journal (mirroring
-  the chain's own bounded-window design) would fix this.
+  embedded `ip:port` only. A real discovery protocol is a substantial
+  project of its own (NAT traversal, a DHT implementation or a gossip
+  membership protocol) -- not something to bolt on safely without being
+  able to test it against real network conditions.
+- **A real Noise handshake** in place of the hand-rolled one -- swapping
+  in the `snow` crate is on purpose left for a session where its exact
+  API can be verified against a compiler, rather than guessed.
+- **The journal is in-memory only**, scoped to one `serve` run -- see
+  `net::journal` module docs for why, and what persisting it would
+  involve.
 - **Live push isn't wired into the TUI** -- `net::sync::push_patch` /
   `apply_incoming` exist and are tested, but nothing calls them from the
-  running app yet (would need a background task + channel back into the
-  synchronous TUI event loop, deliberately left out of this pass to
-  avoid rushing that integration).
+  running app yet. This is deliberately deferred rather than rushed: the
+  TUI's event loop is synchronous, so wiring in live networking safely
+  needs a background task bridged back to it via a channel, and doing
+  that alongside the *same* file the TUI already has open needs the same
+  single-writer care described above.
 - **Connecting to a peer from the TUI** -- `serve`/`join` only exist as
   CLI commands right now.
 

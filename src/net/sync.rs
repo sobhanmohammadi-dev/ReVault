@@ -2,22 +2,18 @@
 //! serving a join/catch-up request, and a peer joining or receiving a
 //! live push.
 //!
-//! # Why catch-up always does a full resync (v1 limitation)
+//! # Catch-up: incremental when possible, full resync otherwise
 //!
 //! `Vault::take_change_log` only captures byte ranges written by the
-//! *most recent* mutating call in this process -- there's no persistent,
-//! seq-indexed history of past patches kept anywhere. That's enough for
-//! a "live push": the admin makes a change and immediately forwards that
-//! change_log to whichever peers are currently connected. It is *not*
-//! enough to reconstruct what changed for a peer that reconnects after
-//! being offline for a while, since by then the relevant change_log
-//! entries are long gone. Rather than get that wrong, a peer who is
-//! behind (including a brand-new peer with `next_seq == 0`) always gets
-//! a full `export_full()` copy. This is correct in every case, just not
-//! maximally efficient for a peer that missed only one or two changes --
-//! a documented place to improve on later (e.g. by having the admin keep
-//! a bounded on-disk journal of recent patches, mirroring the chain's
-//! own bounded-window design).
+//! *most recent* mutating call -- on its own that's only enough for a
+//! live push to already-connected peers. [`PatchJournal`] extends that
+//! into a small bounded history so a peer reconnecting after missing a
+//! few changes can still get an incremental patch (see that module's
+//! docs for why it's in-memory only, not persisted to disk). When the
+//! journal doesn't have unbroken coverage back to where the peer claims
+//! to be -- including a brand-new peer with `next_seq == 0`, or simply
+//! no journal at all -- `serve_one` falls back to a full `export_full()`
+//! copy. That fallback is always correct, just not maximally efficient.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -29,13 +25,20 @@ use crate::core::identity::{Identity, PeerId};
 use crate::core::Vault;
 
 use super::handshake::SecureChannel;
+use super::journal::PatchJournal;
 use super::protocol::SyncMessage;
 
-/// Admin side: accepts one incoming connection, verifies the caller is a
-/// granted recipient of `vault`, and brings them fully up to date.
-/// Returns the connecting peer's identity on success.
-pub async fn serve_one(listener: &TcpListener, my_identity: &Identity, vault: &mut Vault) -> Result<PeerId> {
-    let (stream, _addr) = listener.accept().await.map_err(VaultError::Io)?;
+/// Admin side, lower-level primitive: serves one already-accepted
+/// connection. Split out from [`serve_one`] so a caller that needs to
+/// interleave accepting connections with something else (e.g. reading
+/// admin commands from stdin, via `tokio::select!`) can do so without
+/// this function owning the whole accept loop.
+pub async fn serve_stream(
+    stream: TcpStream,
+    my_identity: &Identity,
+    vault: &mut Vault,
+    journal: Option<&PatchJournal>,
+) -> Result<PeerId> {
     let (mut channel, their_peer_id) = SecureChannel::responder(stream, my_identity).await?;
 
     let granted = vault.list_recipients()?.into_iter().any(|r| r.peer_id == their_peer_id);
@@ -46,11 +49,20 @@ pub async fn serve_one(listener: &TcpListener, my_identity: &Identity, vault: &m
 
     let their_state_bytes = channel.recv().await?;
     match SyncMessage::decode(&their_state_bytes)? {
-        SyncMessage::ChainState { .. } => {
-            // See module docs: every catch-up, regardless of how far
-            // behind the peer claims to be, gets a full resync in v1.
-            let bytes = vault.export_full()?;
-            channel.send(&SyncMessage::FullSync { bytes }.encode()).await?;
+        SyncMessage::ChainState { next_seq, .. } => {
+            let patch = journal.and_then(|j| j.ranges_since(next_seq));
+            match patch {
+                Some(ranges) => {
+                    channel.send(&SyncMessage::Patch { seq: next_seq, ranges }.encode()).await?;
+                }
+                None => {
+                    // No journal, or the peer is further behind than its
+                    // retained window -- always correct, just not the
+                    // most efficient path (see `journal` module docs).
+                    let bytes = vault.export_full()?;
+                    channel.send(&SyncMessage::FullSync { bytes }.encode()).await?;
+                }
+            }
         }
         _ => {
             let _ = channel.send(&SyncMessage::Error { message: "expected a ChainState message".to_string() }.encode()).await;
@@ -59,6 +71,19 @@ pub async fn serve_one(listener: &TcpListener, my_identity: &Identity, vault: &m
     }
 
     Ok(their_peer_id)
+}
+
+/// Convenience wrapper around [`serve_stream`] for callers that don't
+/// need to interleave accepting with anything else: accepts exactly one
+/// connection from `listener` and serves it.
+pub async fn serve_one(
+    listener: &TcpListener,
+    my_identity: &Identity,
+    vault: &mut Vault,
+    journal: Option<&PatchJournal>,
+) -> Result<PeerId> {
+    let (stream, _addr) = listener.accept().await.map_err(VaultError::Io)?;
+    serve_stream(stream, my_identity, vault, journal).await
 }
 
 /// Peer side: connects to `addr`, verifies the responder is really
@@ -133,7 +158,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server_task = tokio::spawn(async move {
-            serve_one(&listener, &listener_identity, &mut vault).await.unwrap();
+            serve_one(&listener, &listener_identity, &mut vault, None).await.unwrap();
         });
 
         let mut joined_vault = join(addr, &peer_identity, &expected_listener_peer, &peer_path).await.unwrap();
@@ -158,12 +183,69 @@ mod tests {
         let listener_identity = Identity::generate();
         let expected_listener_peer = listener_identity.peer_id();
 
-        let server_task = tokio::spawn(async move { serve_one(&listener, &listener_identity, &mut vault).await });
+        let server_task = tokio::spawn(async move { serve_one(&listener, &listener_identity, &mut vault, None).await });
 
         let result = join(addr, &stranger, &expected_listener_peer, &peer_path).await;
         assert!(result.is_err());
 
         let server_result = server_task.await.unwrap();
         assert!(matches!(server_result, Err(VaultError::NotAuthorized)));
+    }
+
+    #[tokio::test]
+    async fn reconnecting_peer_gets_an_incremental_patch_when_journal_covers_it() {
+        let dir = tempdir().unwrap();
+        let admin_path = dir.path().join("admin.rvlt");
+        let peer_path = dir.path().join("peer-replica.rvlt");
+
+        let mut vault = Vault::create(&admin_path, "V", "d", 256 * 1024, "pw", Identity::generate()).unwrap();
+        let peer_identity = Identity::generate();
+        vault.grant_access(&peer_identity.peer_id()).unwrap();
+        let _ = vault.take_change_log(); // not relevant to what this test checks
+
+        let listener_identity_bytes = Identity::generate().to_bytes();
+        let expected_listener_peer = Identity::from_bytes(&listener_identity_bytes).peer_id();
+        let mut journal = PatchJournal::new(8);
+
+        // Peer joins for the first time -- always a full sync, and
+        // establishes what "caught up" (next_seq_before) means for them.
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let (server_result, join_result) = tokio::join!(
+            serve_one(&listener1, &Identity::from_bytes(&listener_identity_bytes), &mut vault, Some(&journal)),
+            join(addr1, &peer_identity, &expected_listener_peer, &peer_path)
+        );
+        server_result.unwrap();
+        drop(join_result.unwrap());
+        let (next_seq_before, _) = vault.chain_state();
+
+        // Admin adds a file and records the resulting patch in the journal.
+        vault.add_file("new.txt", b"added after the peer joined").unwrap();
+        journal.record(next_seq_before, vault.take_change_log());
+
+        // Peer reconnects claiming next_seq_before -- the journal covers
+        // exactly that, so it should get a Patch, not another FullSync.
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let client_fut = async {
+            let stream = tokio::net::TcpStream::connect(addr2).await.unwrap();
+            let (mut channel, _admin_peer) =
+                SecureChannel::initiator(stream, &peer_identity, &expected_listener_peer).await.unwrap();
+            channel
+                .send(&SyncMessage::ChainState { next_seq: next_seq_before, last_hash: [0u8; 32] }.encode())
+                .await
+                .unwrap();
+            let response = channel.recv().await.unwrap();
+            SyncMessage::decode(&response).unwrap()
+        };
+        let (server_result, message) = tokio::join!(
+            serve_one(&listener2, &Identity::from_bytes(&listener_identity_bytes), &mut vault, Some(&journal)),
+            client_fut
+        );
+        server_result.unwrap();
+        match message {
+            SyncMessage::Patch { .. } => {} // expected: incremental, not a full resync
+            other => panic!("expected a Patch, got {other:?}"),
+        }
     }
 }

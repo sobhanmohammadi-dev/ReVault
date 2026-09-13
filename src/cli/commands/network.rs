@@ -8,8 +8,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use tokio::io::AsyncBufReadExt;
+
 use crate::core::{Identity, Vault};
-use crate::net::{sync, InviteCode};
+use crate::net::{sync, InviteCode, PatchJournal};
 
 pub struct Whoami;
 
@@ -61,28 +63,123 @@ impl Revoke {
 pub struct Serve;
 
 impl Serve {
+    /// Runs an interactive serving session: accepts connections from
+    /// granted peers *and* reads simple admin commands from stdin, on a
+    /// single `Vault` handle. Doing both on one handle in one task (via
+    /// `tokio::select!`) is deliberate -- it's what makes it safe to keep
+    /// a `PatchJournal` that actually gets populated. Running a second,
+    /// separate process (e.g. `revault grant` while `serve` is also
+    /// running) against the same vault file at the same time is NOT
+    /// safe and isn't supported: each `Vault` handle caches its own copy
+    /// of the header/allocator in memory, so two independent processes
+    /// writing to the same file could corrupt it. Use the `add`/`update`/
+    /// `delete` commands inside this session instead of a separate CLI
+    /// invocation while `serve` is running.
     pub fn execute(vault: PathBuf, password: String, listen: SocketAddr) -> std::io::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async move {
             let local_identity = Identity::load_or_create()?;
             let mut v = Vault::open(&vault, &password, local_identity).map_err(to_io_err)?;
+            let mut journal = PatchJournal::new(64);
 
             let listener = tokio::net::TcpListener::bind(listen).await?;
-            println!("Serving on {listen}. Waiting for granted peers to connect (Ctrl+C to stop)...");
+            println!("Serving \"{}\" on {listen}.", v.summary().name);
+            println!("Granted peers can sync now. Type 'help' for admin commands.");
 
-            // Each accepted connection gets its own long-lived identity
-            // for the handshake -- reuse the same local identity file
-            // every time, loaded fresh per connection to keep this loop
-            // simple and avoid holding a borrow across iterations.
+            let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            let mut lines = stdin.lines();
+
             loop {
-                let listener_identity = Identity::load_or_create()?;
-                match sync::serve_one(&listener, &listener_identity, &mut v).await {
-                    Ok(peer_id) => println!("Synced {} successfully.", peer_id.fingerprint()),
-                    Err(e) => eprintln!("A peer connection failed: {e}"),
+                print!("> ");
+                {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                }
+
+                tokio::select! {
+                    accept_result = listener.accept() => {
+                        match accept_result {
+                            Ok((stream, _addr)) => {
+                                let listener_identity = Identity::load_or_create()?;
+                                match sync::serve_stream(stream, &listener_identity, &mut v, Some(&journal)).await {
+                                    Ok(peer_id) => println!("\nSynced {} successfully.", peer_id.fingerprint()),
+                                    Err(e) => eprintln!("\nA peer connection failed: {e}"),
+                                }
+                            }
+                            Err(e) => eprintln!("\naccept error: {e}"),
+                        }
+                    }
+                    line = lines.next_line() => {
+                        let Some(line) = line? else {
+                            break; // stdin closed
+                        };
+                        match Self::handle_command(&mut v, &mut journal, line.trim()) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
                 }
             }
+            Ok(())
         })
     }
+
+    /// Returns `Ok(true)` to keep looping, `Ok(false)` to stop serving.
+    fn handle_command(v: &mut Vault, journal: &mut PatchJournal, line: &str) -> std::io::Result<bool> {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            None | Some("help") => {
+                println!("Commands:");
+                println!("  add <source-path> <name>     import a file and push it to synced peers");
+                println!("  update <source-path> <name>  replace a stored file's contents");
+                println!("  delete <name>                remove a stored file");
+                println!("  list                          list stored files");
+                println!("  quit                          stop serving");
+            }
+            Some("list") => {
+                for f in v.list_files().map_err(to_io_err)? {
+                    println!("  {} ({} bytes)", f.name, f.size);
+                }
+            }
+            Some("add") => {
+                let (src, name) = two_args(parts).ok_or_else(|| usage_err("add <source-path> <name>"))?;
+                let data = std::fs::read(&src)?;
+                let (seq, _) = v.chain_state();
+                v.add_file(&name, &data).map_err(to_io_err)?;
+                journal.record(seq, v.take_change_log());
+                println!("Added \"{name}\".");
+            }
+            Some("update") => {
+                let (src, name) = two_args(parts).ok_or_else(|| usage_err("update <source-path> <name>"))?;
+                let data = std::fs::read(&src)?;
+                let (seq, _) = v.chain_state();
+                v.update_file(&name, &data).map_err(to_io_err)?;
+                journal.record(seq, v.take_change_log());
+                println!("Updated \"{name}\".");
+            }
+            Some("delete") => {
+                let name = parts.next().ok_or_else(|| usage_err("delete <name>"))?.to_string();
+                let (seq, _) = v.chain_state();
+                v.delete_file(&name).map_err(to_io_err)?;
+                journal.record(seq, v.take_change_log());
+                println!("Deleted \"{name}\".");
+            }
+            Some("quit") | Some("exit") => return Ok(false),
+            Some(other) => println!("Unknown command '{other}'. Type 'help' for a list."),
+        }
+        Ok(true)
+    }
+}
+
+fn two_args<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<(String, String)> {
+    let a = parts.next()?.to_string();
+    let b = parts.next()?.to_string();
+    Some((a, b))
+}
+
+fn usage_err(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("usage: {msg}"))
 }
 
 pub struct Join;
