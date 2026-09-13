@@ -148,25 +148,38 @@ Planned, in order of how much extra complexity each adds:
    can introduce new ones without any manual step, still with no server
    in the data or control path.
 
-## What's implemented in this pass vs. deferred
+## What's implemented now vs. still deferred
 
 Implemented: `Identity`/`PeerId`, the full envelope-encryption format
-change (format version 2 -- recipient keyring, DEK wrap/unwrap via
-X25519), `Vault::grant_access` / `Vault::revoke_access` (with full key
-rotation + in-place re-encryption of every block), admin-only mutation
-guards (`add_file`/`update_file`/`delete_file`/`grant_access`/
-`revoke_access` all require the vault to have been opened by an identity
-matching its recorded admin), chain-record signing (`ChainRecord::
-new_signed`) and verification (`verify_integrity` now checks every
-record's admin signature, not just its hash linkage), and
-`Vault::open_as_recipient` for a granted peer to open a vault with no
-password at all.
+(v2 -- recipient keyring, DEK wrap/unwrap via X25519), `grant_access` /
+`revoke_access` with full key rotation, admin-only mutation guards,
+signed/verified chain records, `Vault::open_as_recipient`, a
+byte-range change-log (`take_change_log`/`apply_remote_patch`/
+`export_full`) that the sync protocol is built on, a lightweight
+authenticated+encrypted channel (`net::handshake`, X25519 + Ed25519 +
+AES-256-GCM -- explicitly *not* a formally analyzed protocol like Noise,
+see that module's doc comment), the wire sync protocol
+(`net::protocol`, `net::sync`: join / catch-up / live-push patch),
+hex invite codes (`net::invite`), five CLI subcommands (`whoami`,
+`grant`, `revoke`, `serve`, `join`), and grant/revoke wired into the
+Vaults TUI (press `p` on an unlocked vault).
 
-Deferred to the next phase: the actual TCP transport, the Noise
-handshake, the wire sync protocol described above, and any TUI for
-managing peers (granting/revoking is only reachable via the `core` API
-right now, not yet wired into the Vaults screen). All of the above was
-designed so that phase can be added without another format change.
+Still deferred:
+- **Peer discovery** (DHT/gossip) -- v1 is manual invite codes with an
+  embedded `ip:port` only.
+- **A real Noise handshake** in place of the hand-rolled one.
+- **Efficient catch-up sync** -- reconnecting after being offline always
+  triggers a full resync rather than replaying missed patches, because
+  there's no persistent, seq-indexed patch history kept anywhere yet
+  (documented in `net::sync`). A bounded on-disk patch journal (mirroring
+  the chain's own bounded-window design) would fix this.
+- **Live push isn't wired into the TUI** -- `net::sync::push_patch` /
+  `apply_incoming` exist and are tested, but nothing calls them from the
+  running app yet (would need a background task + channel back into the
+  synchronous TUI event loop, deliberately left out of this pass to
+  avoid rushing that integration).
+- **Connecting to a peer from the TUI** -- `serve`/`join` only exist as
+  CLI commands right now.
 
 Note: format version 1 (the original password-direct scheme) is no
 longer readable -- `MIN_SUPPORTED_VERSION` is now 2. There was no real
