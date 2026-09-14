@@ -211,10 +211,13 @@ mod tests {
         // establishes what "caught up" (next_seq_before) means for them.
         let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr1 = listener1.local_addr().unwrap();
-        let (server_result, join_result) = tokio::join!(
-            serve_one(&listener1, &Identity::from_bytes(&listener_identity_bytes), &mut vault, Some(&journal)),
-            join(addr1, &peer_identity, &expected_listener_peer, &peer_path)
-        );
+        let (server_result, join_result) = {
+            let listener_identity = Identity::from_bytes(&listener_identity_bytes);
+            tokio::join!(
+                serve_one(&listener1, &listener_identity, &mut vault, Some(&journal)),
+                join(addr1, &peer_identity, &expected_listener_peer, &peer_path)
+            )
+        };
         server_result.unwrap();
         drop(join_result.unwrap());
         let (next_seq_before, _) = vault.chain_state();
@@ -238,10 +241,10 @@ mod tests {
             let response = channel.recv().await.unwrap();
             SyncMessage::decode(&response).unwrap()
         };
-        let (server_result, message) = tokio::join!(
-            serve_one(&listener2, &Identity::from_bytes(&listener_identity_bytes), &mut vault, Some(&journal)),
-            client_fut
-        );
+        let (server_result, message) = {
+            let listener_identity = Identity::from_bytes(&listener_identity_bytes);
+            tokio::join!(serve_one(&listener2, &listener_identity, &mut vault, Some(&journal)), client_fut)
+        };
         server_result.unwrap();
         match message {
             SyncMessage::Patch { .. } => {} // expected: incremental, not a full resync
