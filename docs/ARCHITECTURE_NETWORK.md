@@ -174,9 +174,25 @@ file open at a time. Each `Vault` handle caches its own copy of the
 header/allocator bitmap in memory; two independent processes (e.g.
 running `revault grant` while `revault serve` is also running against
 the same file) writing to the same file concurrently could corrupt it.
-Use `serve`'s own `add`/`update`/`delete` commands instead of a separate
-CLI invocation while a serve session is running. This isn't enforced
-with a file lock yet -- a reasonable next hardening step.
+Use `serve`'s own `add`/`update`/`delete` commands (or the TUI, while a
+vault is unlocked there) instead of a separate CLI invocation while a
+serve session is running. This isn't enforced with a file lock yet -- a
+reasonable next hardening step.
+
+**The TUI can now serve, too** (`src/tui/network_bridge.rs`): press `n`
+on an unlocked vault to start listening on a port and accept granted
+peers, `n` again to stop. This runs a small Tokio runtime on a
+dedicated background thread that owns the TCP listener and does each
+connection's handshake -- but deliberately never touches the `Vault`
+itself. When a peer reports its chain state, the background thread
+asks the main (TUI) thread what to send back over a plain channel and
+waits for the answer; the main thread answers on its own schedule
+(once per tick, using the live `Vault` + a `PatchJournal` it already
+owns) so the vault is still only ever mutated from the one thread that
+has it open, even though networking now happens concurrently with the
+UI. File adds/updates/deletes made in the TUI while serving are
+recorded into that journal exactly like the CLI's interactive `serve`
+console.
 
 Still deferred, with reasons:
 - **Peer discovery** (DHT/gossip) -- v1 is manual invite codes with an
@@ -187,18 +203,13 @@ Still deferred, with reasons:
 - **A real Noise handshake** in place of the hand-rolled one -- swapping
   in the `snow` crate is on purpose left for a session where its exact
   API can be verified against a compiler, rather than guessed.
-- **The journal is in-memory only**, scoped to one `serve` run -- see
-  `net::journal` module docs for why, and what persisting it would
-  involve.
-- **Live push isn't wired into the TUI** -- `net::sync::push_patch` /
-  `apply_incoming` exist and are tested, but nothing calls them from the
-  running app yet. This is deliberately deferred rather than rushed: the
-  TUI's event loop is synchronous, so wiring in live networking safely
-  needs a background task bridged back to it via a channel, and doing
-  that alongside the *same* file the TUI already has open needs the same
-  single-writer care described above.
-- **Connecting to a peer from the TUI** -- `serve`/`join` only exist as
-  CLI commands right now.
+- **The journal is in-memory only**, scoped to one serving session (CLI
+  `serve` or a TUI session with `n` toggled on) -- see `net::journal`
+  module docs for why, and what persisting it would involve.
+- **Joining a vault from the TUI** -- only `serve` is wired into the
+  TUI; `join` (becoming a peer of someone else's vault) is still
+  CLI-only. The pieces (`net::sync::join`, invite decoding) are all
+  there; it just hasn't been given a TUI form yet.
 
 Note: format version 1 (the original password-direct scheme) is no
 longer readable -- `MIN_SUPPORTED_VERSION` is now 2. There was no real
