@@ -206,10 +206,14 @@ Still deferred, with reasons:
 - **The journal is in-memory only**, scoped to one serving session (CLI
   `serve` or a TUI session with `n` toggled on) -- see `net::journal`
   module docs for why, and what persisting it would involve.
-- **Joining a vault from the TUI** -- only `serve` is wired into the
-  TUI; `join` (becoming a peer of someone else's vault) is still
-  CLI-only. The pieces (`net::sync::join`, invite decoding) are all
-  there; it just hasn't been given a TUI form yet.
+
+Joining is now available from the TUI too (`j` from the Vaults list),
+not just the CLI -- but it's a **blocking** call: it opens a one-off
+Tokio runtime and waits for the connection + full sync to complete
+before the UI responds again. Fine for a LAN peer; a non-blocking
+version would follow the same bridge-to-a-channel pattern
+`NetworkBridge` already uses for serving, and is the natural next step
+if joining over a slower link becomes common.
 
 Note: format version 1 (the original password-direct scheme) is no
 longer readable -- `MIN_SUPPORTED_VERSION` is now 2. There was no real

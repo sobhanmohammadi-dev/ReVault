@@ -5,6 +5,7 @@
 //! self-contained and openable on its own.
 
 pub mod create;
+pub mod join;
 pub mod table;
 pub mod unlock;
 pub mod unlocked;
@@ -18,6 +19,7 @@ use crate::core::{self, Identity, VaultError};
 use crate::tui::log;
 
 use create::{CreateForm, CreateOutcome};
+use join::{JoinForm, JoinOutcome};
 use unlock::{UnlockForm, UnlockOutcome};
 use unlocked::UnlockedState;
 
@@ -32,6 +34,7 @@ pub struct VaultListing {
 pub enum Mode {
     Browsing,
     Creating(CreateForm),
+    Joining(JoinForm),
     Unlocking(UnlockForm, PathBuf, String),
     Unlocked(UnlockedState),
 }
@@ -186,6 +189,36 @@ impl App {
         Ok(())
     }
 
+    /// Connects to a peer, verifies it's really the admin the invite
+    /// claims, and pulls down a full local replica -- synchronously
+    /// (via a one-off Tokio runtime), which briefly blocks the TUI for
+    /// the duration of the connection. Acceptable for a LAN peer; a
+    /// background version of this would follow the same
+    /// bridge-to-a-channel pattern `NetworkBridge` uses for serving.
+    fn try_join(&self, invite_str: &str) -> Result<(), String> {
+        let invite = crate::net::InviteCode::decode(invite_str.trim()).map_err(|e| e.to_string())?;
+        let addr = invite
+            .address
+            .ok_or_else(|| "This invite code has no address to connect to.".to_string())?;
+
+        std::fs::create_dir_all(&self.vaults_dir).map_err(|e| e.to_string())?;
+        let path = self.vaults_dir.join(format!("joined-{}.rvlt", invite.peer_id.fingerprint()));
+        if path.exists() {
+            return Err("A replica from this peer already exists in your vaults directory.".to_string());
+        }
+
+        let my_identity = Identity::from_bytes(&self.identity.to_bytes());
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        let joined = runtime
+            .block_on(crate::net::sync::join(addr, &my_identity, &invite.peer_id, &path))
+            .map_err(|e| e.to_string())?;
+        let vault_name = joined.summary().name;
+        drop(joined);
+
+        log::log_event(&format!("joined vault \"{vault_name}\" as a peer via {addr}"));
+        Ok(())
+    }
+
     pub fn create(&mut self) {
         self.mode = Mode::Creating(CreateForm::default());
     }
@@ -205,6 +238,7 @@ impl App {
             Mode::Browsing => {
                 match key.code {
                     KeyCode::Char('+') => return Mode::Creating(CreateForm::default()),
+                    KeyCode::Char('j') => return Mode::Joining(JoinForm::default()),
                     KeyCode::Up => {
                         self.selected = self.selected.saturating_sub(1);
                     }
@@ -233,6 +267,18 @@ impl App {
                     }
                 },
                 None => Mode::Creating(form),
+            },
+
+            Mode::Joining(mut form) => match join::handle_key(&mut form, key) {
+                Some(JoinOutcome::Cancel) => Mode::Browsing,
+                Some(JoinOutcome::Submit) => match self.try_join(&form.input) {
+                    Ok(()) => Mode::Browsing,
+                    Err(e) => {
+                        form.error = Some(e);
+                        Mode::Joining(form)
+                    }
+                },
+                None => Mode::Joining(form),
             },
 
             Mode::Unlocking(mut form, path, name) => match unlock::handle_key(&mut form, key) {
@@ -273,6 +319,7 @@ impl App {
         match &self.mode {
             Mode::Browsing => table::render(frame, area, &self.listing, self.selected),
             Mode::Creating(form) => create::render(frame, area, form),
+            Mode::Joining(form) => join::render(frame, area, form),
             Mode::Unlocking(form, _path, name) => unlock::render(frame, area, name, form),
             Mode::Unlocked(state) => unlocked::render(frame, area, state),
         }
