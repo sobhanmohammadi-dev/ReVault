@@ -1,6 +1,7 @@
 pub mod app;
 pub mod event;
 pub mod log;
+pub mod network_bridge;
 pub mod paths;
 pub mod settings;
 pub mod tab;

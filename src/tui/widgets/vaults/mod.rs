@@ -149,16 +149,19 @@ impl App {
         !matches!(self.mode, Mode::Browsing)
     }
 
-    /// Called every event-loop tick (not just on key presses) so the 30s
-    /// inactivity timeout is enforced by wall-clock time, not by the next
-    /// key press.
+    /// Called every event-loop tick (not just on key presses) so
+    /// wall-clock-based behavior -- the 30s inactivity timeout, and
+    /// answering pending network sync requests -- happens even when the
+    /// user hasn't pressed anything recently.
     pub fn check_timeout(&mut self) {
-        if let Mode::Unlocked(state) = &self.mode {
+        if let Mode::Unlocked(state) = &mut self.mode {
             if state.session.is_expired() {
                 log::log_event(&format!("vault auto-locked after inactivity: {}", state.name));
                 self.mode = Mode::Browsing;
                 self.refresh();
+                return;
             }
+            state.poll_network();
         }
     }
 
@@ -235,11 +238,12 @@ impl App {
             Mode::Unlocking(mut form, path, name) => match unlock::handle_key(&mut form, key) {
                 Some(UnlockOutcome::Cancel) => Mode::Browsing,
                 Some(UnlockOutcome::Submit) => {
-                    let local_identity = Identity::from_bytes(&self.identity.to_bytes());
+                    let identity_bytes = self.identity.to_bytes();
+                    let local_identity = Identity::from_bytes(&identity_bytes);
                     match core::Vault::open(&path, &form.password, local_identity) {
                         Ok(vault) => {
                             log::log_event(&format!("vault unlocked: {name}"));
-                            Mode::Unlocked(UnlockedState::new(vault, path, name))
+                            Mode::Unlocked(UnlockedState::new(vault, path, name, identity_bytes))
                         }
                         Err(VaultError::IncorrectPassword) => {
                             form.password.clear();

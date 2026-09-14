@@ -10,8 +10,9 @@ use ratatui::{
 };
 
 use crate::core::{self, Session};
-use crate::net::InviteCode;
+use crate::net::{InviteCode, PatchJournal, SyncMessage};
 use crate::tui::log;
+use crate::tui::network_bridge::{self, NetworkBridge};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddField {
@@ -46,6 +47,22 @@ pub struct PeersView {
     pub mode: PeersMode,
 }
 
+/// A live serving session: the network bridge plus the journal used to
+/// answer reconnecting peers with a small patch instead of a full resync
+/// (see `net::journal` docs). Torn down (and the background thread
+/// signaled to stop) on lock/drop.
+pub struct NetworkSession {
+    pub bridge: NetworkBridge,
+    pub journal: PatchJournal,
+}
+
+/// The "type a port to start serving on" prompt.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPrompt {
+    pub port_input: String,
+    pub error: Option<String>,
+}
+
 pub struct UnlockedState {
     pub vault: core::Vault,
     pub path: PathBuf,
@@ -56,10 +73,17 @@ pub struct UnlockedState {
     pub message: Option<String>,
     pub add_form: Option<AddFileForm>,
     pub peers: Option<PeersView>,
+    pub network: Option<NetworkSession>,
+    pub network_prompt: Option<NetworkPrompt>,
+    /// Byte copy of this device's local identity, kept around only to
+    /// hand to a freshly started `NetworkBridge` (which needs its own
+    /// owned `Identity`, reconstructed from these bytes on its own
+    /// thread -- see `NetworkBridge::start` for why).
+    local_identity_bytes: [u8; 64],
 }
 
 impl UnlockedState {
-    pub fn new(vault: core::Vault, path: PathBuf, name: String) -> Self {
+    pub fn new(vault: core::Vault, path: PathBuf, name: String, local_identity_bytes: [u8; 64]) -> Self {
         let mut state = UnlockedState {
             vault,
             path,
@@ -70,6 +94,9 @@ impl UnlockedState {
             message: None,
             add_form: None,
             peers: None,
+            network: None,
+            network_prompt: None,
+            local_identity_bytes,
         };
         state.refresh_files();
         state
@@ -105,6 +132,18 @@ impl UnlockedState {
         self.add_form = Some(AddFileForm::default());
     }
 
+    /// If a serving session is active, records the patch this mutation
+    /// just produced into its journal so reconnecting peers can get an
+    /// incremental sync instead of a full resync.
+    fn record_patch_if_serving(&mut self, seq_before: u64) {
+        if self.network.is_some() {
+            let ranges = self.vault.take_change_log();
+            if let Some(net) = &mut self.network {
+                net.journal.record(seq_before, ranges);
+            }
+        }
+    }
+
     fn submit_add(&mut self) {
         let Some(form) = self.add_form.clone() else { return };
         if form.source_path.trim().is_empty() || form.dest_name.trim().is_empty() {
@@ -122,9 +161,11 @@ impl UnlockedState {
                 return;
             }
         };
+        let (seq_before, _) = self.vault.chain_state();
         match self.vault.add_file(form.dest_name.trim(), &data) {
             Ok(()) => {
                 log::log_event(&format!("file added to vault \"{}\": {}", self.name, form.dest_name.trim()));
+                self.record_patch_if_serving(seq_before);
                 self.refresh_files();
                 self.add_form = None;
                 self.message = Some(format!("Added \"{}\"", form.dest_name.trim()));
@@ -139,9 +180,11 @@ impl UnlockedState {
 
     fn delete_selected(&mut self) {
         let Some(file) = self.files.get(self.selected).cloned() else { return };
+        let (seq_before, _) = self.vault.chain_state();
         match self.vault.delete_file(&file.name) {
             Ok(()) => {
                 log::log_event(&format!("file deleted from vault \"{}\": {}", self.name, file.name));
+                self.record_patch_if_serving(seq_before);
                 self.refresh_files();
                 self.message = Some(format!("Deleted \"{}\"", file.name));
             }
@@ -180,6 +223,59 @@ impl UnlockedState {
             self.name
         ));
         Ok(())
+    }
+
+    fn start_serving(&mut self, port: u16) -> Result<(), String> {
+        let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+        let bridge = NetworkBridge::start(addr, self.local_identity_bytes).map_err(|e| e.to_string())?;
+        log::log_event(&format!("started serving vault \"{}\" on port {port}", self.name));
+        self.network = Some(NetworkSession { bridge, journal: PatchJournal::new(64) });
+        Ok(())
+    }
+
+    fn stop_serving(&mut self) {
+        if self.network.take().is_some() {
+            log::log_event(&format!("stopped serving vault \"{}\"", self.name));
+        }
+    }
+
+    /// Answers any pending peer sync request and surfaces any completed
+    /// sync (or failure) as a status message. Called once per TUI tick.
+    pub fn poll_network(&mut self) {
+        let Some(net) = &mut self.network else { return };
+
+        while let Ok(event) = net.bridge.event_rx.try_recv() {
+            match event {
+                network_bridge::BridgeEvent::Synced(peer_id) => {
+                    self.message = Some(format!("Synced {}", peer_id.fingerprint()));
+                    log::log_event(&format!("peer synced: {} on vault \"{}\"", peer_id.fingerprint(), self.name));
+                }
+                network_bridge::BridgeEvent::Failed(e) => {
+                    self.message = Some(format!("Sync failed: {e}"));
+                }
+            }
+        }
+
+        if let Ok(network_bridge::SyncRequest::Incoming { peer_id, next_seq, respond_to }) = net.bridge.request_rx.try_recv() {
+            let granted = self
+                .vault
+                .list_recipients()
+                .map(|rs| rs.into_iter().any(|r| r.peer_id == peer_id))
+                .unwrap_or(false);
+
+            let response = if !granted {
+                network_bridge::SyncResponse::NotGranted
+            } else {
+                match net.journal.ranges_since(next_seq) {
+                    Some(ranges) => network_bridge::SyncResponse::Message(SyncMessage::Patch { seq: next_seq, ranges }),
+                    None => match self.vault.export_full() {
+                        Ok(bytes) => network_bridge::SyncResponse::Message(SyncMessage::FullSync { bytes }),
+                        Err(e) => network_bridge::SyncResponse::Message(SyncMessage::Error { message: e.to_string() }),
+                    },
+                }
+            };
+            let _ = respond_to.send(response);
+        }
     }
 }
 
@@ -226,6 +322,39 @@ pub fn handle_key(state: &mut UnlockedState, key: KeyEvent) -> Outcome {
         return Outcome::Continue;
     }
 
+    if let Some(mut prompt) = state.network_prompt.take() {
+        match key.code {
+            KeyCode::Esc => {
+                // Leave state.network_prompt as None -- already taken.
+            }
+            KeyCode::Backspace => {
+                prompt.port_input.pop();
+                state.network_prompt = Some(prompt);
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                prompt.port_input.push(c);
+                state.network_prompt = Some(prompt);
+            }
+            KeyCode::Enter => match prompt.port_input.trim().parse::<u16>() {
+                Ok(port) => match state.start_serving(port) {
+                    Ok(()) => {} // leave network_prompt as None: prompt closes
+                    Err(e) => {
+                        prompt.error = Some(e);
+                        state.network_prompt = Some(prompt);
+                    }
+                },
+                Err(_) => {
+                    prompt.error = Some("Enter a valid port number (1-65535)".to_string());
+                    state.network_prompt = Some(prompt);
+                }
+            },
+            _ => {
+                state.network_prompt = Some(prompt);
+            }
+        }
+        return Outcome::Continue;
+    }
+
     if state.peers.is_some() {
         handle_peers_key(state, key);
         return Outcome::Continue;
@@ -239,6 +368,14 @@ pub fn handle_key(state: &mut UnlockedState, key: KeyEvent) -> Outcome {
         KeyCode::Char('d') => state.delete_selected(),
         KeyCode::Char('v') => state.verify(),
         KeyCode::Char('p') => state.open_peers_view(),
+        KeyCode::Char('n') => {
+            if state.network.is_some() {
+                state.stop_serving();
+                state.message = Some("Stopped serving.".to_string());
+            } else {
+                state.network_prompt = Some(NetworkPrompt::default());
+            }
+        }
         _ => {}
     }
     Outcome::Continue
@@ -353,14 +490,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UnlockedState) {
         return;
     }
 
+    if let Some(prompt) = &state.network_prompt {
+        render_network_prompt(frame, area, prompt);
+        return;
+    }
+
     let layout = Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]);
     let [title_a, table_a, message_a] = area.layout(&layout);
 
+    let serving_suffix = match &state.network {
+        Some(net) => format!("  [serving on :{}]", net.bridge.listen_addr.port()),
+        None => String::new(),
+    };
     let title = Paragraph::new(Line::from(format!(
-        "{}  ({} used of {})",
+        "{}  ({} used of {}){}",
         state.name,
         format_bytes(state.vault.used_bytes()),
-        format_bytes(state.vault.capacity_bytes())
+        format_bytes(state.vault.capacity_bytes()),
+        serving_suffix
     )));
     frame.render_widget(title, title_a);
 
@@ -384,6 +531,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UnlockedState) {
     if let Some(msg) = &state.message {
         let message = Paragraph::new(Line::from(msg.as_str()));
         frame.render_widget(message, message_a);
+    }
+}
+
+fn render_network_prompt(frame: &mut Frame, area: Rect, prompt: &NetworkPrompt) {
+    let layout = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]);
+    let [field_a, error_a] = area.layout(&layout);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Port to serve on (peers connect here) ")
+        .border_style(Style::default().fg(Color::Rgb(255, 140, 0)));
+    frame.render_widget(Paragraph::new(Line::from(prompt.port_input.as_str())).block(block), field_a);
+
+    if let Some(err) = &prompt.error {
+        let error_line = Paragraph::new(Line::from(err.as_str())).style(Style::default().fg(Color::Red));
+        frame.render_widget(error_line, error_a);
     }
 }
 
