@@ -10,6 +10,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let blocking = app.blocks_global_nav();
 
     let text = match (blocking, app.selected_tab) {
+        (false, Tab::Vaults) => "Press 'q' to quit, '↹' to navigate tabs, '↵' to unlock, '+' new vault, 'j' join a peer's vault.",
+
         (false, _) => "Press 'q' to quit, '↹' to navigate tabs, '↵' to select.",
 
         (true, Tab::Vaults) => {
