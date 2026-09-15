@@ -626,7 +626,7 @@ impl Vault {
         let data_block_count = if entry.size == 0 {
             0
         } else {
-            entry.size.div_ceil(self.header.block_size as u64)
+            entry.size.div_ceil(self.plain_chunk_len())
         };
         let direct_count = data_block_count.min(super::format::DIRECT_BLOCKS as u64) as usize;
         let mut blocks: Vec<u64> = entry.direct_blocks[..direct_count].to_vec();
@@ -653,7 +653,7 @@ impl Vault {
         let data_block_count = if entry.size == 0 {
             0
         } else {
-            entry.size.div_ceil(self.header.block_size as u64)
+            entry.size.div_ceil(self.plain_chunk_len())
         };
         let direct_count = data_block_count.min(super::format::DIRECT_BLOCKS as u64) as usize;
         let mut all: Vec<u64> = entry.direct_blocks[..direct_count].to_vec();
@@ -1300,7 +1300,12 @@ mod tests {
             v.add_file("a.txt", b"alpha-content-here").unwrap();
         }
         let mut bytes = std::fs::read(&path).unwrap();
-        let data_start = super::super::format::HEADER_SIZE as usize + 4096 * 3; // well past metadata regions, into data
+        // Corrupt a byte a few bytes into the first data block (past its
+        // 4-byte plaintext-length prefix, into the actual ciphertext).
+        // Computed from the real on-disk header rather than a hardcoded
+        // offset, so this doesn't go stale if a region's size changes.
+        let header = super::super::format::Header::decode(&bytes[..super::super::format::HEADER_SIZE as usize]).unwrap();
+        let data_start = header.data_offset as usize + 4;
         bytes[data_start] ^= 0xFF;
         std::fs::write(&path, bytes).unwrap();
 
