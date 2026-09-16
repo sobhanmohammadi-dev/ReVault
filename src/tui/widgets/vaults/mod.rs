@@ -1,11 +1,13 @@
 //! Vaults tab: browse `.rvlt` files found in the configured vaults
-//! directory, create new ones, unlock, and operate on an unlocked vault's
-//! files. The vaults directory is just a plain folder scan -- there is no
+//! directory, create new ones, unlock, and operate on an unlocked
+//! vault's files. Vault/file management only -- peer access
+//! (grant/revoke), joining someone else's vault, and serving to peers
+//! all live in the Network tab (`tui::widgets::network_tab`) instead.
+//! The vaults directory is just a plain folder scan -- there is no
 //! sidecar index -- each `.rvlt` file remains independently
 //! self-contained and openable on its own.
 
 pub mod create;
-pub mod join;
 pub mod table;
 pub mod unlock;
 pub mod unlocked;
@@ -19,7 +21,6 @@ use crate::core::{self, Identity, VaultError};
 use crate::tui::log;
 
 use create::{CreateForm, CreateOutcome};
-use join::{JoinForm, JoinOutcome};
 use unlock::{UnlockForm, UnlockOutcome};
 use unlocked::UnlockedState;
 
@@ -34,7 +35,6 @@ pub struct VaultListing {
 pub enum Mode {
     Browsing,
     Creating(CreateForm),
-    Joining(JoinForm),
     Unlocking(UnlockForm, PathBuf, String),
     Unlocked(UnlockedState),
 }
@@ -47,7 +47,9 @@ pub struct App {
     /// This device's local identity. For a freshly created vault this
     /// becomes the vault's admin identity; for an existing vault, whether
     /// it grants admin rights depends on whether it matches the identity
-    /// recorded at that vault's creation time.
+    /// recorded at that vault's creation time. Also used by the Network
+    /// tab (joining, displaying this device's invite fingerprint) via
+    /// `identity_bytes()`.
     identity: Identity,
 }
 
@@ -148,14 +150,40 @@ impl App {
         }
     }
 
-    pub fn is_modal(&self) -> bool {
+    pub fn vaults_dir(&self) -> &Path {
+        &self.vaults_dir
+    }
+
+    /// Byte copy of this device's local identity -- used by the Network
+    /// tab (joining a vault, displaying this device's invite
+    /// fingerprint) without needing to duplicate identity loading there.
+    pub fn identity_bytes(&self) -> [u8; 64] {
+        self.identity.to_bytes()
+    }
+
+    /// True whenever `q`/`Esc` should be handled locally (locking a
+    /// vault, cancelling a form) rather than quitting the whole app.
+    pub fn intercepts_quit(&self) -> bool {
         !matches!(self.mode, Mode::Browsing)
+    }
+
+    /// True whenever `Tab` has a local meaning (moving between fields in
+    /// a form) and shouldn't switch app tabs. Deliberately *not* true
+    /// for a plain unlocked vault with no form open, so the user can
+    /// still jump to the Network tab to manage that vault's peers.
+    pub fn blocks_tab_switch(&self) -> bool {
+        match &self.mode {
+            Mode::Browsing => false,
+            Mode::Unlocked(state) => state.add_form.is_some(),
+            Mode::Creating(_) | Mode::Unlocking(..) => true,
+        }
     }
 
     /// Called every event-loop tick (not just on key presses) so
     /// wall-clock-based behavior -- the 30s inactivity timeout, and
-    /// answering pending network sync requests -- happens even when the
-    /// user hasn't pressed anything recently.
+    /// answering pending network sync requests for whichever vault is
+    /// unlocked -- happens even when the user hasn't pressed anything
+    /// recently, and regardless of which tab is currently selected.
     pub fn check_timeout(&mut self) {
         if let Mode::Unlocked(state) = &mut self.mode {
             if state.session.is_expired() {
@@ -164,7 +192,7 @@ impl App {
                 self.refresh();
                 return;
             }
-            state.poll_network();
+            crate::tui::widgets::network_tab::poll_network(state);
         }
     }
 
@@ -189,36 +217,6 @@ impl App {
         Ok(())
     }
 
-    /// Connects to a peer, verifies it's really the admin the invite
-    /// claims, and pulls down a full local replica -- synchronously
-    /// (via a one-off Tokio runtime), which briefly blocks the TUI for
-    /// the duration of the connection. Acceptable for a LAN peer; a
-    /// background version of this would follow the same
-    /// bridge-to-a-channel pattern `NetworkBridge` uses for serving.
-    fn try_join(&self, invite_str: &str) -> Result<(), String> {
-        let invite = crate::net::InviteCode::decode(invite_str.trim()).map_err(|e| e.to_string())?;
-        let addr = invite
-            .address
-            .ok_or_else(|| "This invite code has no address to connect to.".to_string())?;
-
-        std::fs::create_dir_all(&self.vaults_dir).map_err(|e| e.to_string())?;
-        let path = self.vaults_dir.join(format!("joined-{}.rvlt", invite.peer_id.fingerprint()));
-        if path.exists() {
-            return Err("A replica from this peer already exists in your vaults directory.".to_string());
-        }
-
-        let my_identity = Identity::from_bytes(&self.identity.to_bytes());
-        let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-        let joined = runtime
-            .block_on(crate::net::sync::join(addr, &my_identity, &invite.peer_id, &path))
-            .map_err(|e| e.to_string())?;
-        let vault_name = joined.summary().name;
-        drop(joined);
-
-        log::log_event(&format!("joined vault \"{vault_name}\" as a peer via {addr}"));
-        Ok(())
-    }
-
     pub fn create(&mut self) {
         self.mode = Mode::Creating(CreateForm::default());
     }
@@ -238,7 +236,6 @@ impl App {
             Mode::Browsing => {
                 match key.code {
                     KeyCode::Char('+') => return Mode::Creating(CreateForm::default()),
-                    KeyCode::Char('j') => return Mode::Joining(JoinForm::default()),
                     KeyCode::Up => {
                         self.selected = self.selected.saturating_sub(1);
                     }
@@ -267,18 +264,6 @@ impl App {
                     }
                 },
                 None => Mode::Creating(form),
-            },
-
-            Mode::Joining(mut form) => match join::handle_key(&mut form, key) {
-                Some(JoinOutcome::Cancel) => Mode::Browsing,
-                Some(JoinOutcome::Submit) => match self.try_join(&form.input) {
-                    Ok(()) => Mode::Browsing,
-                    Err(e) => {
-                        form.error = Some(e);
-                        Mode::Joining(form)
-                    }
-                },
-                None => Mode::Joining(form),
             },
 
             Mode::Unlocking(mut form, path, name) => match unlock::handle_key(&mut form, key) {
@@ -319,7 +304,6 @@ impl App {
         match &self.mode {
             Mode::Browsing => table::render(frame, area, &self.listing, self.selected),
             Mode::Creating(form) => create::render(frame, area, form),
-            Mode::Joining(form) => join::render(frame, area, form),
             Mode::Unlocking(form, _path, name) => unlock::render(frame, area, name, form),
             Mode::Unlocked(state) => unlocked::render(frame, area, state),
         }

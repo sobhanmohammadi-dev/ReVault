@@ -166,31 +166,35 @@ instead of a full resync, five CLI subcommands (`whoami`, `grant`,
 session** -- it accepts peer connections *and* reads admin commands
 (`add`/`update`/`delete`/`list`) from stdin concurrently on one `Vault`
 handle, so mutations made while serving actually populate the journal
-for connected/reconnecting peers -- and grant/revoke wired into the
-Vaults TUI (press `p` on an unlocked vault).
+for connected/reconnecting peers -- and a dedicated **Network tab** in
+the TUI (`src/tui/widgets/network_tab.rs`) for grant/revoke/serve/join,
+kept deliberately separate from the Vaults tab: Vaults is vault/file
+management only, Network owns every connection/peer-to-peer/sharing
+concern, for whichever vault is currently unlocked.
 
 **Important safety note**: only one process should hold a given `.rvlt`
 file open at a time. Each `Vault` handle caches its own copy of the
 header/allocator bitmap in memory; two independent processes (e.g.
 running `revault grant` while `revault serve` is also running against
 the same file) writing to the same file concurrently could corrupt it.
-Use `serve`'s own `add`/`update`/`delete` commands (or the TUI, while a
-vault is unlocked there) instead of a separate CLI invocation while a
-serve session is running. This isn't enforced with a file lock yet -- a
-reasonable next hardening step.
+Use `serve`'s own `add`/`update`/`delete` commands (or the TUI's
+Network tab, while a vault is unlocked there) instead of a separate CLI
+invocation while a serve session is running. This isn't enforced with a
+file lock yet -- a reasonable next hardening step.
 
-**The TUI can now serve, too** (`src/tui/network_bridge.rs`): press `n`
-on an unlocked vault to start listening on a port and accept granted
-peers, `n` again to stop. This runs a small Tokio runtime on a
-dedicated background thread that owns the TCP listener and does each
-connection's handshake -- but deliberately never touches the `Vault`
-itself. When a peer reports its chain state, the background thread
-asks the main (TUI) thread what to send back over a plain channel and
-waits for the answer; the main thread answers on its own schedule
-(once per tick, using the live `Vault` + a `PatchJournal` it already
-owns) so the vault is still only ever mutated from the one thread that
-has it open, even though networking now happens concurrently with the
-UI. File adds/updates/deletes made in the TUI while serving are
+**The TUI can now serve, too**: from the Network tab, `n` starts
+listening on a port and accepting granted peers (for whichever vault is
+currently unlocked from the Vaults tab), `n` again to stop. This runs a
+small Tokio runtime on a dedicated background thread that owns the TCP
+listener and does each connection's handshake -- but deliberately never
+touches the `Vault` itself. When a peer reports its chain state, the
+background thread asks the main (TUI) thread what to send back over a
+plain channel and waits for the answer; the main thread answers on its
+own schedule (once per tick, regardless of which tab is focused, using
+the live `Vault` + a `PatchJournal` it already owns) so the vault is
+still only ever mutated from the one thread that has it open, even
+though networking now happens concurrently with the UI. File
+adds/updates/deletes made from the Vaults tab while serving are
 recorded into that journal exactly like the CLI's interactive `serve`
 console.
 
@@ -204,16 +208,17 @@ Still deferred, with reasons:
   in the `snow` crate is on purpose left for a session where its exact
   API can be verified against a compiler, rather than guessed.
 - **The journal is in-memory only**, scoped to one serving session (CLI
-  `serve` or a TUI session with `n` toggled on) -- see `net::journal`
+  `serve` or a Network-tab serving session) -- see `net::journal`
   module docs for why, and what persisting it would involve.
 
-Joining is now available from the TUI too (`j` from the Vaults list),
-not just the CLI -- but it's a **blocking** call: it opens a one-off
-Tokio runtime and waits for the connection + full sync to complete
-before the UI responds again. Fine for a LAN peer; a non-blocking
-version would follow the same bridge-to-a-channel pattern
-`NetworkBridge` already uses for serving, and is the natural next step
-if joining over a slower link becomes common.
+Joining is available from the Network tab (`j`, works with or without a
+vault currently unlocked) as well as the CLI -- but from the TUI it's a
+**blocking** call: it opens a one-off Tokio runtime and waits for the
+connection + full sync to complete before the UI responds again. Fine
+for a LAN peer; a non-blocking version would follow the same
+bridge-to-a-channel pattern `NetworkBridge` already uses for serving,
+and is the natural next step if joining over a slower link becomes
+common.
 
 Note: format version 1 (the original password-direct scheme) is no
 longer readable -- `MIN_SUPPORTED_VERSION` is now 2. There was no real

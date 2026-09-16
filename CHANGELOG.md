@@ -1,7 +1,33 @@
 # Changelog
 
 Entries group related work; this isn't strictly per-commit. See `git
-log` for the full, granular history.
+log` for the full, granular history. Earlier entries describe the UI
+layout *as it was at the time* -- see the reorganization entry below
+for where things live now.
+
+## TUI: separated Network tab from Vaults tab
+
+Peer management (grant/revoke) and serving had been added directly to
+the Vaults tab's unlocked-vault view, which mixed vault/file concerns
+with network concerns in one screen. Reorganized so each tab has a
+single, clear responsibility:
+
+- **Vaults tab**: vault/file management only -- create, unlock, list,
+  add/delete/verify files. No networking.
+- **Network tab** (new, replacing the placeholder): everything that
+  touches the network -- joining a vault as a peer (works with or
+  without a vault currently unlocked), and, for whichever vault *is*
+  unlocked, granting/revoking peer access and starting/stopping serving
+  it.
+
+The live serving session (background thread + patch journal) still
+lives on the unlocked vault's own state, since its lifecycle has to be
+tied to that specific vault being open -- but the *controls* for it
+moved to the Network tab. Global key handling also split into two
+separate questions it had been conflating (whether `q`/`Esc` should
+quit the app vs. act locally, and whether `Tab` should switch app tabs
+vs. move between form fields), so an unlocked vault with no form open
+no longer blocks switching to the Network tab to manage it.
 
 ## Vault storage engine
 

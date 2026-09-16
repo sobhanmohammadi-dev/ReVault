@@ -1,8 +1,4 @@
-use ratatui::{
-    layout::{Alignment, Rect},
-    widgets::Paragraph,
-    Frame,
-};
+use ratatui::{layout::Rect, Frame};
 
 use crate::tui::{app::App, tab::Tab};
 
@@ -13,9 +9,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         Tab::Network => {
-            let placeholder = Paragraph::new("Network features are coming in a future release.")
-                .alignment(Alignment::Center);
-            frame.render_widget(placeholder, area);
+            crate::tui::widgets::network_tab::render(frame, area, app);
         }
 
         Tab::Logs => {

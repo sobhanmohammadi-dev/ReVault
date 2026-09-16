@@ -76,9 +76,10 @@ cargo run -- start   # launches the TUI
 ## Using the TUI
 
 `cargo run -- start` (or the built binary with no arguments other than
-`start`) opens the interactive app. Four tabs: **Vaults**, **Network**
-(placeholder — see [Known limitations](#known-limitations)), **Logs**,
-**Settings**.
+`start`) opens the interactive app. Four tabs, cleanly separated by
+responsibility: **Vaults** (vault/file management only), **Network**
+(connections, peer-to-peer, sharing — everything that touches the
+network), **Logs**, **Settings**.
 
 ### Vaults tab
 
@@ -87,7 +88,6 @@ Browsing the vault list:
 | Key | Action |
 |---|---|
 | `+` | Create a new vault (name, description, capacity like `10 GB`, password) |
-| `j` | Join a vault as a granted peer, via an invite code |
 | `↑`/`↓` | Move selection |
 | `↵` | Unlock the selected vault (prompts for password) |
 
@@ -98,11 +98,32 @@ Inside an unlocked vault:
 | `a` | Add a file (prompts for a source path on disk and a name to store it under) |
 | `d` | Delete the selected file |
 | `v` | Verify the vault's integrity (chain linkage, signatures, file hashes) |
-| `p` | Manage peers — `g` to grant access via an invite code, `r` to revoke (asks for the password again) |
-| `n` | Start/stop serving this vault to granted peers over the network |
 | `q` / `Esc` | Lock the vault and return to the list |
 
-The vault auto-locks after 30 seconds of inactivity regardless.
+The vault auto-locks after 30 seconds of inactivity regardless. Nothing
+here talks to the network — that's all under the Network tab, which
+operates on whichever vault you currently have unlocked.
+
+### Network tab
+
+Always available, regardless of whether a vault is unlocked:
+
+| Key | Action |
+|---|---|
+| `j` | Join a vault as a granted peer, via an invite code (creates a new local replica, which then shows up in the Vaults tab) |
+
+Once a vault is unlocked (from the Vaults tab), this tab also shows its
+peer list and serving status, and adds:
+
+| Key | Action |
+|---|---|
+| `g` | Grant the unlocked vault's access to a peer, via their invite code |
+| `r` | Revoke the selected peer's access (asks for the vault password again — see [Security model](#security-model)) |
+| `n` | Start/stop serving the unlocked vault to its granted peers |
+
+Switching to the Vaults tab to lock that vault also stops serving it
+(the serving session's lifecycle is tied to the vault being open, even
+though its controls live here).
 
 ### Settings tab
 
@@ -278,16 +299,13 @@ Tracked honestly rather than left implicit:
 
 - **Peer discovery** (DHT/gossip) doesn't exist — v1 is manual invite
   codes with an embedded `ip:port` only.
-- **The Network tab in the TUI is a placeholder.** Serving/joining are
-  reachable from the Vaults tab (`n` to serve, `j` to join) and from the
-  CLI, but there's no dedicated peer-management screen yet.
 - **The sync patch journal is in-memory only**, scoped to one serving
-  session — reconnecting after the admin restarts `serve` (or the TUI
-  session ends) always falls back to a full resync. Always correct,
-  just not maximally efficient.
+  session — reconnecting after the admin restarts `serve` (or the
+  Network tab's serving session ends) always falls back to a full
+  resync. Always correct, just not maximally efficient.
 - **Joining from the TUI blocks the UI** for the duration of the
   connection (a one-off async runtime run synchronously). Fine on a
-  LAN; a background version would follow the same pattern `serve`
+  LAN; a background version would follow the same pattern serving
   already uses.
 - File table and recipient keyring are **fixed-capacity** (scaled from
   a vault's capacity at creation, not infinitely growable).
