@@ -1003,4 +1003,47 @@ mod tests {
         rec.data_hash[0] ^= 0xFF; // simulate corruption without recomputing hash
         assert!(!rec.verify_self());
     }
+
+    #[test]
+    fn file_entry_with_max_length_name_roundtrips() {
+        let long_name: String = "a".repeat(MAX_FILENAME_LEN);
+        let entry = FileEntry {
+            id: 7,
+            name: long_name.clone(),
+            size: 1,
+            blocks_used: 1,
+            direct_blocks: [1; DIRECT_BLOCKS],
+            overflow_block: 0,
+            file_hash: [0; 32],
+            created_at: 0,
+            modified_at: 0,
+            flags: ENTRY_FLAG_OCCUPIED,
+        };
+        let encoded = entry.encode();
+        assert_eq!(encoded.len() as u32, ENTRY_SIZE);
+        let decoded = FileEntry::decode(&encoded).unwrap();
+        assert_eq!(decoded.name, long_name);
+    }
+
+    #[test]
+    fn header_decode_rejects_truncated_buffer() {
+        let h = sample_header();
+        let encoded = h.encode();
+        let truncated = &encoded[..encoded.len() / 2];
+        assert!(matches!(Header::decode(truncated), Err(VaultError::CorruptContainer(_))));
+    }
+
+    #[test]
+    fn recipient_slot_decode_rejects_truncated_buffer() {
+        let slot = RecipientSlot {
+            signing_pubkey: [1u8; 32],
+            encryption_pubkey: [2u8; 32],
+            wrapped_dek: vec![9u8; super::super::crypto::WRAPPED_DEK_LEN],
+            granted_at: 1,
+            flags: RECIPIENT_FLAG_OCCUPIED,
+        };
+        let encoded = slot.encode();
+        let truncated = &encoded[..encoded.len() / 2];
+        assert!(matches!(RecipientSlot::decode(truncated), Err(VaultError::CorruptContainer(_))));
+    }
 }

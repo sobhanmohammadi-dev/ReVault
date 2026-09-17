@@ -13,6 +13,8 @@ use tokio::io::AsyncBufReadExt;
 use crate::core::{Identity, Vault};
 use crate::net::{sync, InviteCode, PatchJournal};
 
+use super::to_io_err;
+
 pub struct Whoami;
 
 impl Whoami {
@@ -205,6 +207,4 @@ impl Join {
     }
 }
 
-fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-}
+

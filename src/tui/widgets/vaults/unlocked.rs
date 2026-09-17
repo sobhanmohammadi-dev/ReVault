@@ -1,5 +1,5 @@
-//! Unlocked-vault file browser: list files, add/delete/verify, feeds the
-//! 30s inactivity session.
+//! Unlocked-vault file browser: list files, add/update/delete/verify,
+//! feeds the 30s inactivity session.
 //!
 //! This module is deliberately vault/file-only. Peer management and
 //! network serving live in `tui::widgets::network_tab` instead -- the
@@ -31,6 +31,15 @@ pub struct AddFileForm {
     pub error: Option<String>,
 }
 
+/// Replaces the contents of the currently *selected* file -- unlike
+/// `AddFileForm`, there's no name field: the destination is whichever
+/// file was selected when `u` was pressed.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateFileForm {
+    pub source_path: String,
+    pub error: Option<String>,
+}
+
 pub struct UnlockedState {
     pub vault: core::Vault,
     pub path: PathBuf,
@@ -40,6 +49,11 @@ pub struct UnlockedState {
     pub session: Session,
     pub message: Option<String>,
     pub add_form: Option<AddFileForm>,
+    pub update_form: Option<UpdateFileForm>,
+    /// Set to the selected file's name while a "really delete this?"
+    /// confirmation is pending -- deletion is irreversible (the blocks
+    /// are freed immediately), so it doesn't fire on a single keypress.
+    pub delete_confirm: Option<String>,
     /// A live serving session, if this vault is currently being served
     /// to peers -- started/stopped from the Network tab, but owned here
     /// so it's torn down automatically when this vault locks.
@@ -62,6 +76,8 @@ impl UnlockedState {
             session: Session::new(),
             message: None,
             add_form: None,
+            update_form: None,
+            delete_confirm: None,
             network: None,
             local_identity_bytes,
         };
@@ -97,6 +113,18 @@ impl UnlockedState {
 
     fn start_add(&mut self) {
         self.add_form = Some(AddFileForm::default());
+    }
+
+    fn start_update(&mut self) {
+        if self.files.get(self.selected).is_some() {
+            self.update_form = Some(UpdateFileForm::default());
+        }
+    }
+
+    fn request_delete(&mut self) {
+        if let Some(file) = self.files.get(self.selected) {
+            self.delete_confirm = Some(file.name.clone());
+        }
     }
 
     /// If a serving session is active, records the patch this mutation
@@ -145,15 +173,53 @@ impl UnlockedState {
         }
     }
 
-    fn delete_selected(&mut self) {
-        let Some(file) = self.files.get(self.selected).cloned() else { return };
+    fn submit_update(&mut self) {
+        let Some(form) = self.update_form.clone() else { return };
+        let Some(target_name) = self.files.get(self.selected).map(|f| f.name.clone()) else {
+            self.update_form = None;
+            return;
+        };
+        if form.source_path.trim().is_empty() {
+            if let Some(f) = &mut self.update_form {
+                f.error = Some("A source path is required".to_string());
+            }
+            return;
+        }
+        let data = match std::fs::read(form.source_path.trim()) {
+            Ok(d) => d,
+            Err(e) => {
+                if let Some(f) = &mut self.update_form {
+                    f.error = Some(format!("Could not read source file: {e}"));
+                }
+                return;
+            }
+        };
         let (seq_before, _) = self.vault.chain_state();
-        match self.vault.delete_file(&file.name) {
+        match self.vault.update_file(&target_name, &data) {
             Ok(()) => {
-                log::log_event(&format!("file deleted from vault \"{}\": {}", self.name, file.name));
+                log::log_event(&format!("file updated in vault \"{}\": {target_name}", self.name));
                 self.record_patch_if_serving(seq_before);
                 self.refresh_files();
-                self.message = Some(format!("Deleted \"{}\"", file.name));
+                self.update_form = None;
+                self.message = Some(format!("Updated \"{target_name}\""));
+            }
+            Err(e) => {
+                if let Some(f) = &mut self.update_form {
+                    f.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn confirm_delete(&mut self) {
+        let Some(name) = self.delete_confirm.take() else { return };
+        let (seq_before, _) = self.vault.chain_state();
+        match self.vault.delete_file(&name) {
+            Ok(()) => {
+                log::log_event(&format!("file deleted from vault \"{}\": {name}", self.name));
+                self.record_patch_if_serving(seq_before);
+                self.refresh_files();
+                self.message = Some(format!("Deleted \"{name}\""));
             }
             Err(e) => self.message = Some(e.to_string()),
         }
@@ -210,12 +276,39 @@ pub fn handle_key(state: &mut UnlockedState, key: KeyEvent) -> Outcome {
         return Outcome::Continue;
     }
 
+    if let Some(form) = &mut state.update_form {
+        match key.code {
+            KeyCode::Esc => {
+                state.update_form = None;
+            }
+            KeyCode::Enter => state.submit_update(),
+            KeyCode::Backspace => {
+                form.source_path.pop();
+            }
+            KeyCode::Char(c) => {
+                form.source_path.push(c);
+            }
+            _ => {}
+        }
+        return Outcome::Continue;
+    }
+
+    if state.delete_confirm.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => state.confirm_delete(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => state.delete_confirm = None,
+            _ => {}
+        }
+        return Outcome::Continue;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Outcome::Lock,
         KeyCode::Up => state.move_selection(-1),
         KeyCode::Down => state.move_selection(1),
         KeyCode::Char('a') => state.start_add(),
-        KeyCode::Char('d') => state.delete_selected(),
+        KeyCode::Char('u') => state.start_update(),
+        KeyCode::Char('d') => state.request_delete(),
         KeyCode::Char('v') => state.verify(),
         _ => {}
     }
@@ -240,6 +333,17 @@ fn format_bytes(bytes: u64) -> String {
 pub fn render(frame: &mut Frame, area: Rect, state: &UnlockedState) {
     if let Some(form) = &state.add_form {
         render_add_form(frame, area, form);
+        return;
+    }
+
+    if let Some(form) = &state.update_form {
+        let target = state.files.get(state.selected).map(|f| f.name.as_str()).unwrap_or("?");
+        render_update_form(frame, area, target, form);
+        return;
+    }
+
+    if let Some(name) = &state.delete_confirm {
+        render_delete_confirm(frame, area, name);
         return;
     }
 
@@ -302,4 +406,32 @@ fn render_add_form(frame: &mut Frame, area: Rect, form: &AddFileForm) {
         let error_line = Paragraph::new(Line::from(err.as_str())).style(Style::default().fg(Color::Red));
         frame.render_widget(error_line, error_a);
     }
+}
+
+fn render_update_form(frame: &mut Frame, area: Rect, target_name: &str, form: &UpdateFileForm) {
+    let layout = Layout::vertical([Constraint::Length(1), Constraint::Length(3), Constraint::Fill(1)]);
+    let [label_a, field_a, error_a] = area.layout(&layout);
+
+    let label = Paragraph::new(Line::from(format!("Replace contents of \"{target_name}\"")));
+    frame.render_widget(label, label_a);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" New content: source file path on disk ")
+        .border_style(Style::default().fg(Color::Rgb(255, 140, 0)));
+    frame.render_widget(Paragraph::new(Line::from(form.source_path.as_str())).block(block), field_a);
+
+    if let Some(err) = &form.error {
+        let error_line = Paragraph::new(Line::from(err.as_str())).style(Style::default().fg(Color::Red));
+        frame.render_widget(error_line, error_a);
+    }
+}
+
+fn render_delete_confirm(frame: &mut Frame, area: Rect, name: &str) {
+    let layout = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]);
+    let [label_a, _rest] = area.layout(&layout);
+
+    let label = Paragraph::new(Line::from(format!("Delete \"{name}\"? This cannot be undone. (y/n)")))
+        .style(Style::default().fg(Color::Red));
+    frame.render_widget(label, label_a);
 }

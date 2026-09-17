@@ -382,4 +382,22 @@ mod tests {
         let b = wrap_dek_for_recipient(&recipient_public, &dek).unwrap();
         assert_ne!(a, b, "fresh ephemeral key + nonce should differ each call");
     }
+
+    #[test]
+    fn block_encryption_handles_empty_plaintext() {
+        // Empty files exist (0 bytes of content); block encryption must
+        // not choke on a zero-length payload.
+        let key = MasterKey::derive(b"pw", &[5u8; SALT_LEN], fast_params()).unwrap();
+        let ct = key.encrypt_block(1, 0, b"").unwrap();
+        let pt = key.decrypt_block(1, 0, &ct).unwrap();
+        assert!(pt.is_empty());
+    }
+
+    #[test]
+    fn different_block_indices_are_not_interchangeable_ciphertext() {
+        let key = MasterKey::derive(b"pw", &[6u8; SALT_LEN], fast_params()).unwrap();
+        let ct_a = key.encrypt_block(1, 5, b"same file, block five").unwrap();
+        let ct_b = key.encrypt_block(1, 6, b"same file, block five").unwrap();
+        assert_ne!(ct_a, ct_b, "same file + same plaintext but different block index must differ");
+    }
 }

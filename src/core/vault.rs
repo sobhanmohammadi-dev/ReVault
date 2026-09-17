@@ -1459,4 +1459,95 @@ mod tests {
         v.revoke_access(&peer.peer_id().signing_public, "pw").unwrap();
         v.verify_integrity().unwrap();
     }
+
+    #[test]
+    fn update_file_does_not_affect_other_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rvlt");
+        let mut v = Vault::create(&path, "V", "d", small_capacity(), "pw", Identity::generate()).unwrap();
+        v.add_file("a.txt", b"alpha original").unwrap();
+        v.add_file("b.txt", b"beta original").unwrap();
+
+        v.update_file("a.txt", b"alpha REPLACED").unwrap();
+
+        assert_eq!(v.read_file("a.txt").unwrap(), b"alpha REPLACED");
+        assert_eq!(v.read_file("b.txt").unwrap(), b"beta original", "unrelated file must be untouched");
+    }
+
+    #[test]
+    fn grant_access_fails_when_recipient_table_full() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rvlt");
+        let mut v = Vault::create(&path, "V", "d", small_capacity(), "pw", Identity::generate()).unwrap();
+
+        for _ in 0..MAX_RECIPIENTS {
+            v.grant_access(&Identity::generate().peer_id()).unwrap();
+        }
+        let one_too_many = Identity::generate().peer_id();
+        let err = v.grant_access(&one_too_many).unwrap_err();
+        assert!(matches!(err, VaultError::RecipientTableFull));
+    }
+
+    #[test]
+    fn delete_then_readd_same_name_uses_latest_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rvlt");
+        let mut v = Vault::create(&path, "V", "d", small_capacity(), "pw", Identity::generate()).unwrap();
+
+        v.add_file("a.txt", b"first version").unwrap();
+        v.delete_file("a.txt").unwrap();
+        v.add_file("a.txt", b"second version, different length!").unwrap();
+
+        assert_eq!(v.read_file("a.txt").unwrap(), b"second version, different length!");
+        assert_eq!(v.list_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn used_bytes_returns_to_baseline_after_delete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rvlt");
+        let mut v = Vault::create(&path, "V", "d", small_capacity(), "pw", Identity::generate()).unwrap();
+        let baseline = v.used_bytes();
+
+        v.add_file("big.bin", &vec![7u8; 4076 * 5]).unwrap();
+        assert!(v.used_bytes() > baseline, "adding a file should consume blocks");
+
+        v.delete_file("big.bin").unwrap();
+        assert_eq!(v.used_bytes(), baseline, "deleting should free exactly what was allocated");
+    }
+
+    #[test]
+    fn sequential_updates_do_not_leak_blocks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rvlt");
+        let mut v = Vault::create(&path, "V", "d", small_capacity(), "pw", Identity::generate()).unwrap();
+        v.add_file("f.txt", &vec![1u8; 4076 * 2]).unwrap();
+        let steady_state = v.used_bytes();
+
+        for i in 0..10u8 {
+            v.update_file("f.txt", &vec![i; 4076 * 2]).unwrap();
+            assert_eq!(v.used_bytes(), steady_state, "same-size update should not grow used space over repeated calls");
+        }
+    }
+
+    #[test]
+    fn chain_survives_many_operations_past_the_retained_window() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rvlt");
+        let mut v = Vault::create(&path, "V", "d", small_capacity(), "pw", Identity::generate()).unwrap();
+
+        // small_capacity() gives max_chain_records = 64 (see Vault::create's
+        // sizing formula); push well past that so old records roll off the
+        // ring buffer and verify_integrity still succeeds over whatever
+        // window remains.
+        for i in 0..40 {
+            let name = format!("f{i}.txt");
+            v.add_file(&name, b"tiny").unwrap();
+            v.delete_file(&name).unwrap();
+        }
+        v.add_file("final.txt", b"still here").unwrap();
+
+        v.verify_integrity().unwrap();
+        assert_eq!(v.read_file("final.txt").unwrap(), b"still here");
+    }
 }

@@ -174,7 +174,9 @@ impl App {
     pub fn blocks_tab_switch(&self) -> bool {
         match &self.mode {
             Mode::Browsing => false,
-            Mode::Unlocked(state) => state.add_form.is_some(),
+            Mode::Unlocked(state) => {
+                state.add_form.is_some() || state.update_form.is_some() || state.delete_confirm.is_some()
+            }
             Mode::Creating(_) | Mode::Unlocking(..) => true,
         }
     }

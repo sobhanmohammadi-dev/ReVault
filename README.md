@@ -29,6 +29,7 @@ who can sync.
 - [How sharing works](#how-sharing-works)
 - [The `.rvlt` file format](#the-rvlt-file-format)
 - [Security model](#security-model)
+- [Design rationale](docs/DESIGN_RATIONALE.md) (separate doc)
 - [Project layout](#project-layout)
 - [Testing](#testing)
 - [Known limitations](#known-limitations)
@@ -69,7 +70,7 @@ Requires a recent stable Rust toolchain (edition 2024).
 ```sh
 cd Ruvault
 cargo build
-cargo test    # 93 tests
+cargo test    # 109 tests
 cargo run -- start   # launches the TUI
 ```
 
@@ -96,7 +97,8 @@ Inside an unlocked vault:
 | Key | Action |
 |---|---|
 | `a` | Add a file (prompts for a source path on disk and a name to store it under) |
-| `d` | Delete the selected file |
+| `u` | Replace the selected file's contents (prompts for a new source path) |
+| `d` | Delete the selected file (asks `y`/`n` to confirm — irreversible) |
 | `v` | Verify the vault's integrity (chain linkage, signatures, file hashes) |
 | `q` / `Esc` | Lock the vault and return to the list |
 
@@ -138,8 +140,30 @@ vault's internal, cryptographic integrity chain.
 
 ## Using the CLI
 
-Alongside `start` (the TUI), five subcommands cover the network feature
-end to end without the TUI:
+Alongside `start` (the TUI), the CLI gives full parity with both the
+Vaults and Network tabs — everything below is scriptable, no TUI
+required.
+
+Vault/file management:
+
+```sh
+# Create a vault.
+cargo run -- create my-vault.rvlt --name "My Vault" --capacity "10 GB" --password <pw>
+
+# List its files.
+cargo run -- list my-vault.rvlt --password <pw>
+
+# Add, replace, or remove a file.
+cargo run -- add my-vault.rvlt --password <pw> ./photo.png photo.png
+cargo run -- update my-vault.rvlt --password <pw> ./photo-v2.png photo.png
+cargo run -- delete my-vault.rvlt --password <pw> photo.png
+
+# Verify integrity: chain linkage, every record's admin signature, and
+# every stored file's content hash.
+cargo run -- verify my-vault.rvlt --password <pw>
+```
+
+Network/sharing:
 
 ```sh
 # Print this device's identity/invite code. Include --listen if you're
@@ -284,14 +308,18 @@ docs/
 cargo test
 ```
 
-93 tests across every layer: on-disk format round-trips and corruption
-detection, crypto primitives (including wrap/unwrap and tamper
-rejection), the block allocator, full vault workflows (create, add,
-update, delete, capacity enforcement, integrity verification), the
-network layer (a real handshake over a loopback TCP socket, a full
-join-and-read integration test, journal coverage logic, wire-format
-round-trips), and TUI-adjacent logic (capacity parsing, slugification,
-settings persistence).
+109 tests across every layer: on-disk format round-trips, truncated/
+malformed-input rejection, and boundary cases (max-length names);
+crypto primitives (wrap/unwrap, tamper rejection, empty-plaintext and
+per-block-index edge cases); the block allocator (including zero-size
+and double-free edge cases); full vault workflows (create, add, update,
+delete, capacity enforcement, integrity verification, update isolation
+between files, block reuse under repeated updates, recipient-table
+exhaustion, and the hash chain surviving well past its retained
+ring-buffer window); the network layer (a real handshake over a
+loopback TCP socket, a full join-and-read integration test, journal
+coverage logic, wire-format round-trips); and TUI-adjacent logic
+(capacity parsing, slugification, settings persistence).
 
 ## Known limitations
 

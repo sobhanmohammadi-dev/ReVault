@@ -22,11 +22,12 @@ fn vaults_hint(app: &App) -> &'static str {
         VaultsMode::Browsing => "Press 'q' to quit, '↹' to navigate tabs, '↵' to unlock, '+' new vault.",
         VaultsMode::Creating(_) => "Press ↵ to continue/submit, Esc to cancel, ↹/⬇⬆ to move between fields.",
         VaultsMode::Unlocking(..) => "Press ↵ to unlock, Esc to cancel.",
-        VaultsMode::Unlocked(state) if state.add_form.is_some() => {
+        VaultsMode::Unlocked(state) if state.add_form.is_some() || state.update_form.is_some() => {
             "Press ↵ to continue/submit, Esc to cancel, ↹/⬇⬆ to switch fields."
         }
+        VaultsMode::Unlocked(state) if state.delete_confirm.is_some() => "Press 'y' to confirm delete, 'n'/Esc to cancel.",
         VaultsMode::Unlocked(_) => {
-            "Press 'q' to lock, '↹' to switch tabs, '⬇⬆' to navigate, 'a' add file, 'd' delete file, 'v' verify."
+            "Press 'q' to lock, '↹' to switch tabs, '⬇⬆' to navigate, 'a' add, 'u' update, 'd' delete, 'v' verify."
         }
     }
 }

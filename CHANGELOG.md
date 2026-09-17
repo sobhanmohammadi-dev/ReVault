@@ -5,6 +5,38 @@ log` for the full, granular history. Earlier entries describe the UI
 layout *as it was at the time* -- see the reorganization entry below
 for where things live now.
 
+## Polish pass: CLI completion, TUI safety, more tests, design rationale
+
+- **CLI reached parity with the Vaults tab.** Previously the CLI could
+  only do networking (`whoami`/`grant`/`revoke`/`serve`/`join`) -- there
+  was no way to even create a vault without the TUI. Added
+  `create`/`list`/`verify`/`add`/`update`/`delete`, so every vault
+  operation is scriptable.
+- **TUI gained `update` (`u`), which had been missing entirely** despite
+  `Vault::update_file` existing since the very first version of the
+  engine -- the TUI could add and delete files but never replace one in
+  place.
+- **Delete now asks for confirmation** (`y`/`n`) instead of firing on a
+  single keypress -- it's irreversible (blocks are freed immediately),
+  so a stray `d` shouldn't be able to destroy data.
+- **16 new tests**, chosen to cover gaps rather than pad the count:
+  update leaving other files untouched, the recipient keyring's actual
+  capacity limit being enforced, delete-then-readd of the same name,
+  used-space returning to baseline after delete, repeated same-size
+  updates not leaking blocks, the hash chain surviving well past its
+  retained ring-buffer window (a real wraparound test, not just a small
+  one), truncated/malformed on-disk buffers being rejected rather than
+  panicking, and a few crypto/allocator edge cases (empty plaintext,
+  double-free, zero-size allocation).
+- **`docs/DESIGN_RATIONALE.md`**: a written justification for every
+  non-trivial algorithmic choice in the codebase (why Argon2id/AES-GCM/
+  Ed25519/X25519/SHA-256, why bitmap+first-fit allocation, why linear
+  scan over a hash index for the file table and recipient keyring, why
+  the chain is a bounded ring buffer, why sync ships byte-range patches
+  instead of semantic diffs) -- so those decisions have something
+  written down to revisit against, instead of living only in commit
+  messages.
+
 ## TUI: separated Network tab from Vaults tab
 
 Peer management (grant/revoke) and serving had been added directly to

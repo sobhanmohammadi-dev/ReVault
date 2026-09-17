@@ -232,4 +232,20 @@ mod tests {
             std::env::remove_var("REVAULT_HOME");
         }
     }
+
+    #[test]
+    fn peer_id_from_bytes_rejects_wrong_length() {
+        assert!(PeerId::from_bytes(&[0u8; 10]).is_err());
+        assert!(PeerId::from_bytes(&[0u8; 100]).is_err());
+    }
+
+    #[test]
+    fn verify_signature_rejects_malformed_public_key_gracefully() {
+        // An all-zero byte string is not a valid Ed25519 point; this must
+        // return an error, not panic.
+        let identity = Identity::generate();
+        let sig = identity.sign(b"message");
+        let bogus_key = [0u8; SIGNING_PUBLIC_LEN];
+        assert!(verify_signature(&bogus_key, b"message", &sig).is_err());
+    }
 }

@@ -140,4 +140,35 @@ mod tests {
             assert_eq!(a.is_free(i), b.is_free(i));
         }
     }
+
+    #[test]
+    fn allocate_zero_returns_empty_and_changes_nothing() {
+        let mut a = BlockAllocator::new(10);
+        let got = a.allocate(0);
+        assert!(got.is_empty());
+        assert_eq!(a.free_count(), 10);
+    }
+
+    #[test]
+    fn freeing_an_already_free_block_is_idempotent() {
+        let mut a = BlockAllocator::new(4);
+        a.free(&[2]); // never allocated -- already free
+        assert_eq!(a.occupied_count(), 0);
+        let got = a.allocate(1);
+        a.free(&got);
+        a.free(&got); // double free of the same block
+        assert_eq!(a.occupied_count(), 0);
+        assert_eq!(a.free_count(), 4);
+    }
+
+    #[test]
+    fn mark_occupied_then_free_roundtrips() {
+        let mut a = BlockAllocator::new(8);
+        a.mark_occupied(&[0, 3, 5]);
+        assert_eq!(a.occupied_count(), 3);
+        assert!(!a.is_free(3));
+        a.free(&[3]);
+        assert_eq!(a.occupied_count(), 2);
+        assert!(a.is_free(3));
+    }
 }
