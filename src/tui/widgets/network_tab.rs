@@ -154,6 +154,7 @@ fn try_join(app: &App, invite_str: &str) -> Result<(), String> {
 fn submit_grant(state: &mut UnlockedState, input: &str) -> Result<(), String> {
     let invite = InviteCode::decode(input.trim()).map_err(|e| e.to_string())?;
     state.vault.grant_access(&invite.peer_id).map_err(|e| e.to_string())?;
+    state.refresh_recipients();
     log::log_event(&format!(
         "granted access to {} on vault \"{}\"",
         invite.peer_id.fingerprint(),
@@ -164,6 +165,7 @@ fn submit_grant(state: &mut UnlockedState, input: &str) -> Result<(), String> {
 
 fn submit_revoke(state: &mut UnlockedState, target: &PeerId, password: &str) -> Result<(), String> {
     state.vault.revoke_access(&target.signing_public, password).map_err(|e| e.to_string())?;
+    state.refresh_recipients();
     log::log_event(&format!(
         "revoked access from {} on vault \"{}\" (key rotated)",
         target.fingerprint(),
@@ -202,8 +204,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
 
             KeyCode::Char('r') => {
-                let recipients = current_unlocked_mut(app).and_then(|state| state.vault.list_recipients().ok());
-                let target = recipients.and_then(|rs| rs.get(app.network_ui.recipients_selected).map(|r| r.peer_id));
+                let target = current_unlocked(app)
+                    .and_then(|state| state.recipients.get(app.network_ui.recipients_selected))
+                    .map(|r| r.peer_id);
                 match target {
                     Some(target) => NetworkTabMode::ConfirmRevoke { target, password: String::new(), error: None },
                     None => NetworkTabMode::Idle,
@@ -229,7 +232,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 NetworkTabMode::Idle
             }
             KeyCode::Down => {
-                let len = current_unlocked_mut(app).and_then(|s| s.vault.list_recipients().ok()).map(|r| r.len()).unwrap_or(0);
+                let len = current_unlocked(app).map(|s| s.recipients.len()).unwrap_or(0);
                 if app.network_ui.recipients_selected + 1 < len {
                     app.network_ui.recipients_selected += 1;
                 }
@@ -373,7 +376,7 @@ fn render_idle(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(Line::from(serving_status)), status_a);
 
-    let recipients = state.vault.list_recipients().unwrap_or_default();
+    let recipients = &state.recipients;
     let header = Row::new(["Fingerprint", "Granted at"]).style(Style::new().bold()).bottom_margin(1);
     let rows: Vec<Row> = recipients
         .iter()

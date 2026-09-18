@@ -58,6 +58,12 @@ pub struct UnlockedState {
     /// to peers -- started/stopped from the Network tab, but owned here
     /// so it's torn down automatically when this vault locks.
     pub network: Option<NetworkSession>,
+    /// Cached granted-peers list, for the Network tab to render without
+    /// needing `&mut Vault` -- `Vault::list_recipients` reads from the
+    /// file handle and so needs `&mut self`, but rendering only ever
+    /// gets `&App`. Refreshed on unlock and after every grant/revoke;
+    /// never stale for longer than one key press.
+    pub recipients: Vec<core::RecipientInfo>,
     /// Byte copy of this device's local identity, kept around only to
     /// hand to a freshly started `NetworkBridge` (which needs its own
     /// owned `Identity`, reconstructed from these bytes on its own
@@ -79,10 +85,18 @@ impl UnlockedState {
             update_form: None,
             delete_confirm: None,
             network: None,
+            recipients: Vec::new(),
             local_identity_bytes,
         };
         state.refresh_files();
+        state.refresh_recipients();
         state
+    }
+
+    pub fn refresh_recipients(&mut self) {
+        if let Ok(recipients) = self.vault.list_recipients() {
+            self.recipients = recipients;
+        }
     }
 
     pub fn refresh_files(&mut self) {
