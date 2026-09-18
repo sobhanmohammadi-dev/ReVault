@@ -12,14 +12,6 @@ other people's devices decrypt access and sync changes to them directly,
 device to device — no central server ever holds vault data or decides
 who can sync.
 
-> **Status.** This is an actively-developed project, built and verified
-> incrementally across many sessions (93 automated tests, all passing).
-> It has not had independent security review. The cryptography uses
-> well-established primitives throughout, but the network handshake in
-> particular is a deliberately simple, from-scratch construction — see
-> [Security model](#security-model) below before relying on it for
-> anything sensitive.
-
 ## Contents
 
 - [Features](#features)
